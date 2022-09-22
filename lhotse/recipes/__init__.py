@@ -1,4 +1,6 @@
 from .adept import download_adept, prepare_adept
+from .aidatatang_200zh import download_aidatatang_200zh, prepare_aidatatang_200zh
+from .aidatatang_cs import prepare_aidatatang_cs
 from .aishell import download_aishell, prepare_aishell
 from .aishell4 import download_aishell4, prepare_aishell4
 from .ali_meeting import download_ali_meeting, prepare_ali_meeting
@@ -25,6 +27,7 @@ from .gigaspeech import prepare_gigaspeech
 from .heroico import download_heroico, prepare_heroico
 from .hifitts import download_hifitts, prepare_hifitts
 from .icsi import download_icsi, prepare_icsi
+from .iwslt2022_dialect import prepare_iwslt2022_dialect, prepare_iwslt2022_dialect_eval
 from .l2_arctic import prepare_l2_arctic
 from .libricss import download_libricss, prepare_libricss
 from .librimix import download_librimix, prepare_librimix
@@ -34,15 +37,18 @@ from .ljspeech import download_ljspeech, prepare_ljspeech
 from .magicdata import download_magicdata, prepare_magicdata
 from .mgb2 import prepare_mgb2
 from .mls import prepare_mls
+from .mixer6 import prepare_mixer6
 from .mobvoihotwords import download_mobvoihotwords, prepare_mobvoihotwords
 from .mtedx import download_mtedx, prepare_mtedx
 from .musan import download_musan, prepare_musan
 from .nsc import prepare_nsc
 from .peoples_speech import prepare_peoples_speech
 from .rir_noise import download_rir_noise, prepare_rir_noise
+from .seame import prepare_seame
 from .spgispeech import download_spgispeech, prepare_spgispeech
 from .stcmds import download_stcmds, prepare_stcmds
 from .switchboard import prepare_switchboard
+from .soapies import download_soapies, prepare_soapies
 from .tedlium import download_tedlium, prepare_tedlium
 from .thchs_30 import download_thchs_30, prepare_thchs_30
 from .timit import download_timit, prepare_timit

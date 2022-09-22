@@ -410,11 +410,17 @@ def test_concat_cuts_with_duration_factor():
 
 def test_bucketing_sampler_single_cuts():
     cut_set = DummyManifest(CutSet, begin_id=0, end_id=1000)
-    sampler = BucketingSampler(cut_set, sampler_type=SimpleCutSampler)
-    sampled_cuts = []
-    for batch in sampler:
-        sampled_cuts.extend(batch)
-    assert set(cut_set.ids) == set(c.id for c in sampled_cuts)
+    for method in ("equal_duration", "equal_len"):
+        sampler = BucketingSampler(
+            cut_set,
+            sampler_type=SimpleCutSampler,
+            bucket_method=method,
+            num_buckets=10
+        )
+        sampled_cuts = []
+        for batch in sampler:
+            sampled_cuts.extend(batch)
+        assert set(cut_set.ids) == set(c.id for c in sampled_cuts)
 
 
 def test_bucketing_sampler_single_cuts_equal_duration():
@@ -430,7 +436,6 @@ def test_bucketing_sampler_single_cuts_equal_duration():
         num_buckets=10,
     )
 
-    # Ensure that each consecutive bucket has less cuts than the previous one
     sampled_cuts, bucket_cum_durs = [], []
     prev_min, prev_max = 0, 0
     num_overlapping_bins = 0

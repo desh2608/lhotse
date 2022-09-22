@@ -482,6 +482,8 @@ class Cut:
         cuts = []
         supervisions_index = self.index_supervisions(index_mixed_tracks=True)
         for segment in self.supervisions:
+            if segment.id in ("EN2001a-1", "EN2001a-488"):
+                pass
             if min_duration is None:
                 # Cut boundaries are equal to the supervision segment boundaries.
                 new_start, new_duration = segment.start, segment.duration
@@ -2630,7 +2632,7 @@ class MixedCut(Cut):
             )
         if len(new_tracks) == 1:
             # The truncation resulted in just a single cut - simply return it.
-            return new_tracks[0].cut
+            return MixedCut.from_mono(new_tracks[0].cut)
 
         new_cut = MixedCut(
             id=self.id if preserve_id else str(uuid4()), tracks=new_tracks
@@ -3019,7 +3021,7 @@ class MixedCut(Cut):
             return mixer.unmixed_feats
 
     @rich_exception_info
-    def load_audio(self, mixed: bool = True) -> Optional[np.ndarray]:
+    def load_audio(self, mixed: bool = True, channels=None) -> Optional[np.ndarray]:
         """
         Loads the audios of the source cuts and mix them on-the-fly.
 
@@ -3044,20 +3046,18 @@ class MixedCut(Cut):
             reference_audio = reference_cut.load_audio()
             reference_energy = audio_energy(reference_audio)
 
-        try:
-            mixer = AudioMixer(
-                self.tracks[0].cut.load_audio(),
-                sampling_rate=self.tracks[0].cut.sampling_rate,
-                reference_energy=reference_energy,
-            )
-        except NonPositiveEnergyError as e:
-            logging.warning(
-                f"{e}\nNote: we cannot mix signal with a given SNR to the reference audio with zero energy. "
-                f'Cut ID: "{self.tracks[0].cut.id}"'
-            )
-            raise
-
-        for pos, track in enumerate(self.tracks[1:], start=1):
+        if channels is None:
+            tracks = [t for i, t in enumerate(self.tracks)]
+        else:
+            tracks = [t for i, t in enumerate(self.tracks) if i in channels]
+         
+        mixer = AudioMixer(
+            tracks[0].cut.load_audio(),
+            sampling_rate=self.tracks[0].cut.sampling_rate,
+            reference_energy=reference_energy,
+        )
+        #for pos, track in enumerate(self.tracks[1:], start=1):
+        for pos, track in enumerate(tracks[1:], start=1):
             try:
                 if pos == reference_pos and reference_audio is not None:
                     audio = reference_audio  # manual caching to avoid duplicated I/O
@@ -3088,7 +3088,6 @@ class MixedCut(Cut):
             )
         else:
             audio = mixer.unmixed_audio
-
         return audio
 
     def plot_tracks_features(self):
@@ -3368,6 +3367,10 @@ class MixedCut(Cut):
             id=data["id"],
             tracks=[MixTrack.from_dict(track) for track in data["tracks"]],
         )
+
+    @staticmethod
+    def from_mono(cut: MonoCut) -> "MixedCut":
+        return MixedCut(id=cut.id, tracks=[MixTrack(cut=cut)])
 
     def with_features_path_prefix(self, path: Pathlike) -> "MixedCut":
         if not self.has_features:
@@ -5585,8 +5588,7 @@ def mix_cuts(cuts: Iterable[Cut]) -> MixedCut:
     """Return a MixedCut that consists of the input Cuts mixed with each other as-is."""
     # The following is a fold (accumulate/aggregate) operation; it starts with cuts[0], and mixes it with cuts[1];
     #  then takes their mix and mixes it with cuts[2]; and so on.
-    return reduce(mix, cuts)
-
+    return MixedCut.from_mono(next(iter(cuts))) if len(cuts) == 1 else reduce(mix, cuts)
 
 def append_cuts(cuts: Iterable[Cut]) -> Cut:
     """Return a MixedCut that consists of the input Cuts appended to each other as-is."""
