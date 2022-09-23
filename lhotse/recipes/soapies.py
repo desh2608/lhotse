@@ -9,7 +9,6 @@ import re
 from collections import defaultdict
 from functools import partial
 import glob
-from lxml import etree
 
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Union
@@ -36,6 +35,16 @@ VALID_CATEGORIES = ("Mc", "Mn", "Ll", "Lm", "Lo", "Lt", "Lu", "Nd", "Zs")
 KEEP_LIST = ["\u2019"]
 
 
+def check_and_import_dependencies():
+    try:
+        from lxml import etree
+    except:
+        raise ImportError(
+            "Soapies data preparation requires the 'lxml' package to be installed. "
+            "Please install it with 'pip install lxml' and try again."
+        )
+
+
 ###############################################################################
 #                             Download and Untar
 ###############################################################################
@@ -46,6 +55,7 @@ lang_shortname = {
     "sesotho": "sot",
     "setswana": "tsn",
 }
+
 
 def download_soapies(
     target_dir: Pathlike = ".",
@@ -58,7 +68,9 @@ def download_soapies(
     # Download the splits.
     completed_detector = target_dir / ".splits.completed"
     if completed_detector.is_file():
-        logging.info(f"Skipping downloading splits because {completed_detector} exists.")
+        logging.info(
+            f"Skipping downloading splits because {completed_detector} exists."
+        )
     else:
         zip_path = target_dir / "splits.zip"
         urlretrieve_progress(
@@ -71,7 +83,6 @@ def download_soapies(
             f.extractall(target_dir / "splits")
 
         completed_detector.touch()
-
 
     langs_list = list(lang_shortname.keys())
     # If for some reason languages = None, assume this also means 'all'
@@ -112,6 +123,8 @@ def prepare_soapies(
     output_dir: Optional[Pathlike] = Path("./"),
     languages: Optional[Union[str, Sequence[str]]] = "all",
 ) -> Dict[str, Dict[str, Dict[str, Union[RecordingSet, SupervisionSet]]]]:
+
+    check_and_import_dependencies()
 
     # Resolve corpus_dir type
     if isinstance(corpus_dir, str):
@@ -165,7 +178,13 @@ def prepare_single_soapy_language(
         uttids.add(fname.stem)
 
     sname = lang_shortname[language]
-    dev_list = corpus_dir / "splits" / f"cs_eng{sname}_balanced" / "transcriptions" / f"eng{sname}_dev_set_utterance_ids.txt"
+    dev_list = (
+        corpus_dir
+        / "splits"
+        / f"cs_eng{sname}_balanced"
+        / "transcriptions"
+        / f"eng{sname}_dev_set_utterance_ids.txt"
+    )
     dev_uttids = set()
     with open(dev_list, "r") as f:
         for line in f:
@@ -174,7 +193,13 @@ def prepare_single_soapy_language(
                 dev_uttids.add(uttid)
 
     sname = lang_shortname[language]
-    test_list = corpus_dir / "splits" / f"cs_eng{sname}_balanced" / "transcriptions" / f"eng{sname}_tst_set_utterance_ids.txt"
+    test_list = (
+        corpus_dir
+        / "splits"
+        / f"cs_eng{sname}_balanced"
+        / "transcriptions"
+        / f"eng{sname}_tst_set_utterance_ids.txt"
+    )
     test_uttids = set()
     with open(test_list, "r") as f:
         for line in f:
@@ -184,7 +209,7 @@ def prepare_single_soapy_language(
 
     train_uttids = set()
     for uttid in uttids:
-        if uttid in dev_uttids  or uttid in test_uttids:
+        if uttid in dev_uttids or uttid in test_uttids:
             continue
         train_uttids.add(uttid)
 
@@ -194,14 +219,19 @@ def prepare_single_soapy_language(
     audio_dir = corpus_dir / language / "audio"
     with open(xml_file, "r") as f:
         tree = etree.parse(f)
-        for split, uttids in zip(("train", "dev", "test"),
-                                 (train_uttids, dev_uttids, test_uttids)):
+        for split, uttids in zip(
+            ("train", "dev", "test"), (train_uttids, dev_uttids, test_uttids)
+        ):
             recordings = []
             segments = []
             for utterance in tree.xpath("//utterance"):
-                speaker = utterance.xpath('./speaker_id/text()')[0].replace(' ', '_')
-                wav = utterance.xpath('./audio/text()')[0]
-                text = ' '.join(utterance.xpath('.//transcription/text()')).upper().replace('!', "'")
+                speaker = utterance.xpath("./speaker_id/text()")[0].replace(" ", "_")
+                wav = utterance.xpath("./audio/text()")[0]
+                text = (
+                    " ".join(utterance.xpath(".//transcription/text()"))
+                    .upper()
+                    .replace("!", "'")
+                )
                 uttid = Path(wav).stem
                 if uttid in uttids:
                     recordings.append(Recording.from_file(str(audio_dir / wav)))
@@ -222,7 +252,6 @@ def prepare_single_soapy_language(
 
             if len(recordings) == 0:
                 logging.warning(f"No .wav files found in {audio_dir}")
-
 
             recordings, supervisions = remove_missing_recordings_and_supervisions(
                 recordings, supervisions
@@ -247,4 +276,3 @@ def prepare_single_soapy_language(
                 )
 
     return dict(manifests)
-

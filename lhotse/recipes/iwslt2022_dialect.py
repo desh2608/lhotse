@@ -30,9 +30,10 @@ from lhotse.utils import Pathlike
 from lhotse.manipulation import combine
 
 
-def check_dependencies():
+def check_and_import_dependencies():
     try:
-        import pyarabic
+        import pyarabic.number as number
+        from pyarabic import araby
     except:
         raise ImportError(
             "IWSLT 2022 data preparation requires the 'pyarabic' package to be installed. "
@@ -71,9 +72,7 @@ def prepare_iwslt2022_dialect_eval(
     """
     Prepares manifests for the eval splits.
     """
-    check_dependencies()
-    import pyarabic.number as number
-    from pyarabic import araby
+    check_and_import_dependencies()
 
     manifests = {}
     corpus_dir = Path(corpus_dir)

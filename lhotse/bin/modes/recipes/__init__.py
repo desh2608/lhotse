@@ -37,6 +37,7 @@ from .libritts import *
 from .ljspeech import *
 from .magicdata import *
 from .mgb2 import *
+from .mixer6 import *
 from .mls import *
 from .mtedx import *
 from .musan import *
