@@ -71,7 +71,9 @@ def test_filter(manifest_type):
 
     with as_lazy(data) as lazy_data:
         lazy_result = lazy_data.filter(predicate)
-        assert list(lazy_result) == list(expected)
+        with pytest.raises(NotImplementedError):
+            assert list(lazy_result) == list(expected)
+        assert list(lazy_result.to_eager()) == list(expected)
 
 
 @pytest.mark.parametrize(
@@ -213,6 +215,6 @@ def test_dillable():
             ids = list(ex.map(_get_ids, [lazy_cuts]))
 
         assert ids[0] == [
-            "dummy-cut-0000-random-suffix",
-            "dummy-cut-0001-random-suffix",
+            "dummy-mono-cut-0000-random-suffix",
+            "dummy-mono-cut-0001-random-suffix",
         ]

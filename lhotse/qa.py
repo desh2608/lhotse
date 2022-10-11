@@ -1,7 +1,7 @@
 import logging
 from collections import defaultdict
 from math import isclose
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple, Union
 
 import numpy as np
 
@@ -65,13 +65,16 @@ def fix_manifests(
     recordings, supervisions = remove_missing_recordings_and_supervisions(
         recordings, supervisions
     )
-    if len(recordings) == 0 or len(supervisions) == 0:
-        raise ValueError(
-            "There are no matching recordings and supervisions in the input manifests."
-        )
+    # We don't use len(recordings) or len(supervisions) here because recordings and supervisions can be lazy.
+    assert (
+        len(frozenset(r.id for r in recordings)) > 0
+    ), "No recordings left after fixing the manifests."
+
     supervisions = trim_supervisions_to_recordings(recordings, supervisions)
-    if len(supervisions) == 0:
-        raise ValueError("All supervisions exceed the recordings duration.")
+    assert (
+        len(frozenset(s.id for s in supervisions)) > 0
+    ), "No supervisions left after fixing the manifests."
+
     return recordings, supervisions
 
 
@@ -150,11 +153,12 @@ def remove_missing_recordings_and_supervisions(
         )
     only_in_supervisions = recording_ids_in_sups - recording_ids
     if only_in_supervisions:
-        n_orig_sups = len(supervisions)
+        supervision_ids = frozenset(s.id for s in supervisions)
         supervisions = supervisions.filter(
             lambda s: s.recording_id not in only_in_supervisions
         )
-        n_removed_sups = n_orig_sups - len(supervisions)
+        supervision_ids_after = frozenset(s.id for s in supervisions)
+        n_removed_sups = len(supervision_ids) - len(supervision_ids_after)
         logging.warning(
             f"Removed {n_removed_sups} supervisions with no corresponding recordings "
             f"(for a total of {len(only_in_supervisions)} recording IDs)."
@@ -163,12 +167,16 @@ def remove_missing_recordings_and_supervisions(
 
 
 def trim_supervisions_to_recordings(
-    recordings: RecordingSet, supervisions: SupervisionSet
+    recordings: Union[Recording, RecordingSet],
+    supervisions: Iterable[SupervisionSegment],
+    verbose: bool = True,
 ) -> SupervisionSet:
     """
     Return a new :class:`~lhotse.supervision.SupervisionSet` with supervisions that are
     not exceeding the duration of their corresponding :class:`~lhotse.audio.Recording`.
     """
+    if isinstance(recordings, Recording):
+        recordings = RecordingSet.from_recordings([recordings])
     if recordings.is_lazy:
         recordings = RecordingSet.from_recordings(iter(recordings))
 
@@ -184,11 +192,11 @@ def trim_supervisions_to_recordings(
             trimmed += 1
             s = s.trim(recordings[s.recording_id].duration)
         sups.append(s)
-    if removed:
+    if verbose and removed:
         logging.warning(
             f"Removed {removed} supervisions starting after the end of the recording."
         )
-    if trimmed:
+    if verbose and trimmed:
         logging.warning(
             f"Trimmed {trimmed} supervisions exceeding the end of the recording."
         )

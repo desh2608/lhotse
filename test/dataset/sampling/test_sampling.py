@@ -412,10 +412,7 @@ def test_bucketing_sampler_single_cuts():
     cut_set = DummyManifest(CutSet, begin_id=0, end_id=1000)
     for method in ("equal_duration", "equal_len"):
         sampler = BucketingSampler(
-            cut_set,
-            sampler_type=SimpleCutSampler,
-            bucket_method=method,
-            num_buckets=10
+            cut_set, sampler_type=SimpleCutSampler, bucket_method=method, num_buckets=10
         )
         sampled_cuts = []
         for batch in sampler:
@@ -708,7 +705,7 @@ def test_sampler_filter(sampler_cls):
         # a full epoch.
         max_duration=10.0,
     )
-    removed_cut_id = "dummy-cut-0010"
+    removed_cut_id = "dummy-mono-cut-0010"
     sampler.filter(lambda cut: cut.id != removed_cut_id)
     sampled_cuts = []
     for batch in sampler:
@@ -736,7 +733,7 @@ def test_cut_pairs_sampler_filter():
         # a full epoch.
         max_source_frames=1000,
     )
-    removed_cut_id = "dummy-cut-0010"
+    removed_cut_id = "dummy-mono-cut-0010"
     sampler.filter(lambda cut: cut.id != removed_cut_id)
 
     source_cuts, target_cuts = [], []

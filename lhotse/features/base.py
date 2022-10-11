@@ -18,7 +18,7 @@ from lhotse.audio import Recording
 from lhotse.augmentation import AugmentFn
 from lhotse.features.io import FeaturesWriter, get_reader
 from lhotse.lazy import AlgorithmMixin
-from lhotse.serialization import Serializable, load_yaml, save_to_yaml
+from lhotse.serialization import LazyMixin, Serializable, load_yaml, save_to_yaml
 from lhotse.utils import (
     Pathlike,
     Seconds,
@@ -196,7 +196,7 @@ class FeatureExtractor(metaclass=ABCMeta):
         storage: FeaturesWriter,
         sampling_rate: int,
         offset: Seconds = 0,
-        channel: Optional[int] = None,
+        channel: Optional[Union[int, List[int]]] = None,
         augment_fn: Optional[AugmentFn] = None,
     ) -> "Features":
         """
@@ -217,7 +217,7 @@ class FeatureExtractor(metaclass=ABCMeta):
         :param storage: a ``FeaturesWriter`` object that will handle storing the feature matrices.
         :param offset: an offset in seconds for where to start reading the recording - when used for
             ``Cut`` feature extraction, must be equal to ``Cut.start``.
-        :param channel: an optional channel number to insert into ``Features`` manifest.
+        :param channel: an optional channel number(s) to insert into ``Features`` manifest.
         :param augment_fn: an optional ``WavAugmenter`` instance to modify the waveform before feature extraction.
         :return: a ``Features`` manifest item for the extracted feature matrix (it is not written to disk).
         """
@@ -593,12 +593,13 @@ class FeatureSet(Serializable, AlgorithmMixin):
         """Alias property for ``self.features``"""
         return self.features
 
-    def to_eager(self) -> "FeatureSet":
-        return FeatureSet(list(self))
-
     @staticmethod
-    def from_features(features: Iterable[Features]) -> "FeatureSet":
-        return FeatureSet(list(features))  # just for consistency with other *Sets
+    def from_features(features: Union[Iterable[Features], LazyMixin]) -> "FeatureSet":
+        return (
+            FeatureSet([f for f in features])
+            if isinstance(features, LazyMixin)
+            else FeatureSet(list(features))
+        )
 
     from_items = from_features
 
@@ -699,7 +700,7 @@ class FeatureSet(Serializable, AlgorithmMixin):
     def find(
         self,
         recording_id: str,
-        channel_id: int = 0,
+        channel_id: Union[int, List[int]] = 0,
         start: Seconds = 0.0,
         duration: Optional[Seconds] = None,
         leeway: Seconds = 0.05,
@@ -766,7 +767,7 @@ class FeatureSet(Serializable, AlgorithmMixin):
     def load(
         self,
         recording_id: str,
-        channel_id: int = 0,
+        channel_id: Union[int, List[int]] = 0,
         start: Seconds = 0.0,
         duration: Optional[Seconds] = None,
     ) -> np.ndarray:
