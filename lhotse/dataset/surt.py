@@ -195,6 +195,7 @@ class K2SurtDataset(torch.utils.data.Dataset):
         invalid_cuts = []
         source_feats = []
         source_boundaries = []
+        speakers = defaultdict(list)
 
         for cut in cuts:
             cut_sups = [[] for _ in range(self.num_channels)]
@@ -202,15 +203,22 @@ class K2SurtDataset(torch.utils.data.Dataset):
 
             cut_sources = []
             cut_source_boundaries = []
+            cut_speakers = [[] for _ in range(self.num_channels)]
+            speaker_map = {}
             invalid_cut = False
 
             for sup in sorted(cut.supervisions, key=lambda s: s.start):
                 # Assign the supervision to the first channel that is either empty or
                 # has a supervision that ends before the current supervision starts.
                 assigned = False
+                if sup.speaker not in speaker_map:
+                    speaker_map[sup.speaker] = len(speaker_map) + 1
+                speaker_idx = speaker_map[sup.speaker]
+
                 for i in range(self.num_channels):
                     if len(cut_sups[i]) == 0 or last_sup_end[i] <= sup.start:
                         cut_sups[i].append(sup)
+                        cut_speakers[i].append(speaker_idx)
                         last_sup_end[i] = max(last_sup_end[i], sup.end)
                         assigned = True
                         break
@@ -225,6 +233,7 @@ class K2SurtDataset(torch.utils.data.Dataset):
                     invalid_cut = True
                     min_end_channel = last_sup_end.index(min(last_sup_end))
                     cut_sups[min_end_channel].append(sup)
+                    cut_speakers[min_end_channel].append(speaker_idx)
                     last_sup_end[min_end_channel] = max(
                         last_sup_end[min_end_channel], sup.end
                     )
@@ -264,6 +273,7 @@ class K2SurtDataset(torch.utils.data.Dataset):
                 invalid_cuts.append(cut.id)
                 continue
             supervisions[cut.id] = cut_sups
+            speakers[cut.id] = cut_speakers
             if self.return_sources:
                 source_feats.append(cut_sources)
                 source_boundaries.append(cut_source_boundaries)
@@ -297,6 +307,7 @@ class K2SurtDataset(torch.utils.data.Dataset):
                 ]
                 for cut_sups in supervisions.values()
             ],
+            "speakers": list(speakers.values()),
         }
         if self.return_cuts:
             batch["cuts"] = cuts
