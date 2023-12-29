@@ -1,5 +1,6 @@
+import random
 from collections import defaultdict
-from typing import Callable, Dict, List, Union
+from typing import Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -121,6 +122,8 @@ class K2SurtDataset(torch.utils.data.Dataset):
         input_strategy: BatchIO = PrecomputedFeatures(),
         pad_value: float = LOG_EPSILON,
         strict: bool = False,
+        max_prefix_speakers: int = 0,
+        speaker_buffer_frames: Optional[List[int]] = None,
     ):
         """
         k2 ASR IterableDataset constructor.
@@ -161,6 +164,8 @@ class K2SurtDataset(torch.utils.data.Dataset):
         self.input_strategy = input_strategy
         self.pad_value = pad_value
         self.strict = strict
+        self.max_prefix_speakers = max_prefix_speakers
+        self.speaker_buffer_frames = ifnone(speaker_buffer_frames, [0])
 
         # This attribute is a workaround to constantly growing HDF5 memory
         # throughout the epoch. It regularly closes open file handles to
@@ -187,6 +192,8 @@ class K2SurtDataset(torch.utils.data.Dataset):
         for tnfm in self.cut_transforms:
             cuts = tnfm(cuts)
 
+        num_features = cuts[0].num_features
+
         # Assign supervisions to channels based on their start times.
         # ``supervisions`` is a dict indexed by cut id, and each value is a list of
         # lists of supervisions. The outer list is indexed by channel, and the inner
@@ -195,25 +202,90 @@ class K2SurtDataset(torch.utils.data.Dataset):
         invalid_cuts = []
         source_feats = []
         source_boundaries = []
-        speakers = defaultdict(list)
 
-        for cut in cuts:
+        # ``relative_speaker_ids`` is a dict indexed by cut id, and each value is a list of
+        # relative speaker labels, ordered by FIFO. We also create a dict for the
+        # absolute speaker labels, which is indexed by cut id.
+        relative_speaker_ids = defaultdict(list)
+        absolute_speaker_ids = defaultdict(list)
+
+        # Also create a global speaker map, which is indexed by the absolute speaker
+        # labels, and each value is the speaker index. This will be used later to
+        # get speaker buffer for prefixing.
+        global_speaker_map = {v: k for k, v in enumerate(cuts.speakers)}
+
+        if self.max_prefix_speakers > 0:
+            num_prefix_speakers = random.randint(0, self.max_prefix_speakers)
+            num_buffer_frames = random.choice(self.speaker_buffer_frames)
+            # We will create a repository of speaker frames as we go through the cuts.
+            # For this, we initialize a empty buffer for each speaker.
+            speaker_frame_repo = [
+                np.zeros((0, num_features), dtype=np.float32)
+                for _ in range(len(global_speaker_map))
+            ]
+            # We will also assign speakers to prefix. For this, we initialize a matrix with
+            # random global speakers, and some of those indices will be overwritten.
+            speaker_prefix_matrix = np.random.randint(
+                0, len(global_speaker_map), size=(len(cuts), num_prefix_speakers)
+            )
+        else:
+            num_prefix_speakers = 0
+            speaker_frame_repo = None
+
+        for cut_idx, cut in enumerate(cuts):
             cut_sups = [[] for _ in range(self.num_channels)]
             last_sup_end = [0.0 for _ in range(self.num_channels)]
 
             cut_sources = []
             cut_source_boundaries = []
             cut_speakers = [[] for _ in range(self.num_channels)]
-            speaker_map = {}
             invalid_cut = False
+
+            speakers = []
+            for sup in cut.supervisions:
+                if sup.speaker not in speakers:
+                    speakers.append(sup.speaker)
+            if self.max_prefix_speakers == 0:
+                # Assign the next relative speaker index.
+                local_speaker_map = {spk: i + 1 for i, spk in enumerate(speakers)}
+            else:
+                # Assign each speaker a random index in (1, max_prefix_speakers).
+                # We will only use "num_prefix_speakers" which means that some of the
+                # current speakers will not be in the prefix. We will make the distribution
+                # heavier at the front, i.e., probability of an index is inversely proportional
+                # to the index. This is to ensure that we have more speakers in the prefix.
+                spk_range = np.arange(1, self.max_prefix_speakers + 1)
+                prefix_spk_ids = np.random.choice(
+                    spk_range,
+                    size=len(speakers),
+                    replace=False,
+                    p=np.flip(spk_range) / np.sum(spk_range),
+                )
+                # Now create the "local" speaker map. If the speaker index is <= num_prefix_speakers,
+                # we keep it, otherwise we assign a new index.
+                local_speaker_map = {}
+                j = 1
+                for spk, prefix_spk_id in zip(speakers, prefix_spk_ids):
+                    if prefix_spk_id <= num_prefix_speakers:
+                        # This speaker will be in the prefix.
+                        local_speaker_map[spk] = prefix_spk_id
+                    else:
+                        # This speaker will not be in the prefix. Assign a new index.
+                        local_speaker_map[spk] = num_prefix_speakers + j
+                        j += 1
+
+                for spk_id, relative_idx in local_speaker_map.items():
+                    if relative_idx <= num_prefix_speakers:
+                        # Put the speaker in its correct position in the prefix matrix.
+                        speaker_prefix_matrix[
+                            cut_idx, relative_idx - 1
+                        ] = global_speaker_map[spk_id]
 
             for sup in sorted(cut.supervisions, key=lambda s: s.start):
                 # Assign the supervision to the first channel that is either empty or
                 # has a supervision that ends before the current supervision starts.
                 assigned = False
-                if sup.speaker not in speaker_map:
-                    speaker_map[sup.speaker] = len(speaker_map) + 1
-                speaker_idx = speaker_map[sup.speaker]
+                speaker_idx = local_speaker_map[sup.speaker]
 
                 for i in range(self.num_channels):
                     if len(cut_sups[i]) == 0 or last_sup_end[i] <= sup.start:
@@ -236,6 +308,25 @@ class K2SurtDataset(torch.utils.data.Dataset):
                     cut_speakers[min_end_channel].append(speaker_idx)
                     last_sup_end[min_end_channel] = max(
                         last_sup_end[min_end_channel], sup.end
+                    )
+
+                if speaker_frame_repo is not None:
+                    # Add the speaker frames to the repository.
+                    feats = cut.load_features()
+                    start_frame = compute_num_frames(
+                        sup.start, cut.frame_shift, cut.sampling_rate
+                    )
+                    end_frame = compute_num_frames(
+                        sup.end, cut.frame_shift, cut.sampling_rate
+                    )
+                    speaker_frame_repo[
+                        global_speaker_map[sup.speaker]
+                    ] = np.concatenate(
+                        [
+                            speaker_frame_repo[global_speaker_map[sup.speaker]],
+                            feats[start_frame:end_frame],
+                        ],
+                        axis=0,
                     )
 
             if self.return_sources:
@@ -273,10 +364,56 @@ class K2SurtDataset(torch.utils.data.Dataset):
                 invalid_cuts.append(cut.id)
                 continue
             supervisions[cut.id] = cut_sups
-            speakers[cut.id] = cut_speakers
+            relative_speaker_ids[cut.id] = cut_speakers
+            # Sort the absolute speaker ids by relative speaker index, and then discard
+            # the relative speaker index.
+            absolute_speaker_ids[cut.id] = [
+                spk_id
+                for _, spk_id in sorted(local_speaker_map.items(), key=lambda x: x[1])
+            ]
             if self.return_sources:
                 source_feats.append(cut_sources)
                 source_boundaries.append(cut_source_boundaries)
+
+        if speaker_frame_repo is not None:
+            # Sub-select fixed number of frames for each speaker. If we have fewer
+            # frames than this number, we will repeat the frames.
+            speaker_frame_repo_ = np.zeros(
+                (len(speaker_frame_repo), num_buffer_frames, num_features),
+                dtype=np.float32,
+            )
+            for i, frames in enumerate(speaker_frame_repo):
+                if frames.shape[0] >= num_buffer_frames:
+                    # Get a random range
+                    start_idx = random.randint(0, frames.shape[0] - num_buffer_frames)
+                    speaker_frame_repo_[i] = frames[
+                        start_idx : start_idx + num_buffer_frames
+                    ]
+                else:
+                    speaker_frame_repo_[i] = np.tile(
+                        frames, (num_buffer_frames // frames.shape[0] + 1, 1)
+                    )[:num_buffer_frames]
+
+            # Create speaker prefix using speaker_frame_repo_ and speaker_prefix_matrix.
+            # First we create a one-hot matrix.
+            speaker_prefix_matrix_one_hot = np.zeros(
+                (len(cuts), num_prefix_speakers, len(global_speaker_map)), dtype=np.int8
+            )
+            speaker_prefix_matrix_one_hot[
+                np.arange(len(cuts))[:, None],
+                np.arange(num_prefix_speakers)[None, :],
+                speaker_prefix_matrix,
+            ] = 1
+            # Then we multiply it with the speaker_frame_repo_.
+            speaker_prefix = np.einsum(
+                "abc,cde->abde", speaker_prefix_matrix_one_hot, speaker_frame_repo_
+            )
+            # Reshape it to make all speaker frames contiguous.
+            speaker_prefix = speaker_prefix.reshape(
+                (len(cuts), num_prefix_speakers * num_buffer_frames, num_features)
+            )
+        else:
+            speaker_prefix = None
 
         # Remove invalid cuts.
         if len(invalid_cuts) > 0:
@@ -307,7 +444,12 @@ class K2SurtDataset(torch.utils.data.Dataset):
                 ]
                 for cut_sups in supervisions.values()
             ],
-            "speakers": list(speakers.values()),
+            "speakers": list(relative_speaker_ids.values()),
+            "absolute_speaker_ids": absolute_speaker_ids,
+            "speaker_prefix": torch.from_numpy(speaker_prefix)
+            if speaker_prefix is not None
+            else None,
+            "num_prefix_speakers": num_prefix_speakers,
         }
         if self.return_cuts:
             batch["cuts"] = cuts

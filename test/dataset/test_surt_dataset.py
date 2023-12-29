@@ -1,9 +1,13 @@
+from collections import defaultdict
+
+import numpy as np
 import pytest
 from torch.utils.data import DataLoader
 
 from lhotse.cut import CutSet
 from lhotse.dataset.sampling import SimpleCutSampler
 from lhotse.dataset.surt import K2SurtDataset
+from lhotse.utils import compute_num_frames
 
 
 @pytest.fixture
@@ -13,8 +17,16 @@ def cut_set():
 
 @pytest.mark.parametrize("num_workers", [0, 1])
 @pytest.mark.parametrize("return_sources", [True, False])
-def test_surt_iterable_dataset(cut_set, num_workers, return_sources):
-    dataset = K2SurtDataset(return_sources=return_sources, return_cuts=True)
+@pytest.mark.parametrize("max_prefix_speakers", [0, 4])
+def test_surt_iterable_dataset(
+    cut_set, num_workers, return_sources, max_prefix_speakers
+):
+    dataset = K2SurtDataset(
+        return_sources=return_sources,
+        return_cuts=True,
+        max_prefix_speakers=max_prefix_speakers,
+        speaker_buffer_frames=[10],
+    )
     sampler = SimpleCutSampler(cut_set, shuffle=False, max_cuts=10000)
     # Note: "batch_size=None" disables the automatic batching mechanism,
     #       which is required when Dataset takes care of the collation itself.
@@ -36,4 +48,34 @@ def test_surt_iterable_dataset(cut_set, num_workers, return_sources):
         assert all(
             len(batch["source_feats"][i]) == len(batch["cuts"][i].supervisions)
             for i in range(2)
+        )
+    if max_prefix_speakers > 0:
+        assert batch["speaker_prefix"] is not None
+        assert len(batch["speaker_prefix"]) == 2
+        prefix = batch["speaker_prefix"][1]
+        num_prefix_speakers = batch["num_prefix_speakers"]
+        buffers = []
+        for i in range(num_prefix_speakers):
+            buffers.append(prefix[i * 10 : (i + 1) * 10])
+        cut = batch["cuts"][1]
+        feats = cut.load_features()
+        speaker_feats = defaultdict(list)
+        for channel in range(2):
+            for sup, spk in zip(
+                batch["supervisions"][1][channel], batch["speakers"][1][channel]
+            ):
+                start_frame = compute_num_frames(
+                    sup.start, cut.frame_shift, cut.sampling_rate
+                )
+                end_frame = compute_num_frames(
+                    sup.end, cut.frame_shift, cut.sampling_rate
+                )
+                feat = feats[start_frame:end_frame]
+                speaker_feats[spk].append(feat)
+        speaker_feats = {
+            spk: np.concatenate(feats, axis=0) for spk, feats in speaker_feats.items()
+        }
+        assert all(
+            i + 1 not in speaker_feats or buffer.numpy() in speaker_feats[i + 1]
+            for i, buffer in enumerate(buffers)
         )
