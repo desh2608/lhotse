@@ -1,8 +1,10 @@
+import os
 import random
 import types
 import warnings
+from contextlib import contextmanager
 from functools import partial
-from typing import Any, Callable, Iterable, List, Optional, TypeVar, Union
+from typing import Any, Callable, Iterable, List, Literal, Optional, TypeVar, Union
 
 from lhotse.serialization import (
     LazyMixin,
@@ -11,7 +13,13 @@ from lhotse.serialization import (
     extension_contains,
     open_best,
 )
-from lhotse.utils import Pathlike, fastcopy, is_module_available, streaming_shuffle
+from lhotse.utils import (
+    Pathlike,
+    build_rng,
+    fastcopy,
+    is_module_available,
+    streaming_shuffle,
+)
 
 T = TypeVar("T")
 
@@ -60,7 +68,8 @@ class AlgorithmMixin(LazyMixin, Iterable):
         *manifests,
         stop_early: bool = False,
         weights: Optional[List[Union[int, float]]] = None,
-        seed: int = 0,
+        seed: Union[int, Literal["trng"]] = 0,
+        max_open_streams: Optional[int] = None,
     ):
         """
         Merges multiple manifest iterables into a new iterable by lazily multiplexing them during iteration time.
@@ -79,6 +88,50 @@ class AlgorithmMixin(LazyMixin, Iterable):
         return cls(
             LazyIteratorMultiplexer(
                 *manifests, stop_early=stop_early, weights=weights, seed=seed
+            )
+        )
+
+    @classmethod
+    def infinite_mux(
+        cls,
+        *manifests,
+        weights: Optional[List[Union[int, float]]] = None,
+        seed: Union[int, Literal["trng"]] = 0,
+        max_open_streams: Optional[int] = None,
+    ):
+        """
+        Merges multiple manifest iterables into a new iterable by lazily multiplexing them during iteration time.
+        Unlike ``mux()``, this method allows to limit the number of max open sub-iterators at any given time.
+
+        To enable this, it performs 2-stage sampling.
+        First, it samples with replacement the set of iterators ``I`` to construct a subset ``I_sub``
+        of size ``max_open_streams``.
+        Then, for each iteration step, it samples an iterator ``i`` from ``I_sub``,
+        fetches the next item from it, and yields it.
+        Once ``i`` becomes exhausted, it is replaced with a new iterator ``j`` sampled from ``I_sub``.
+
+        .. caution:: Do not use this method with inputs that are infinitely iterable as they will
+            silently break the multiplexing property by only using a subset of the input iterables.
+
+        .. caution:: This method is not recommended for multiplexing for a small amount of iterations,
+            as it may be much less accurate than ``mux()`` depending on the number of open streams,
+            iterable sizes, and the random seed.
+
+        :param manifests: iterables to be multiplexed.
+            They can be either lazy or eager, but the resulting manifest will always be lazy.
+        :param weights: an optional weight for each iterable, affects the probability of it being sampled.
+            The weights are uniform by default.
+            If lengths are known, it makes sense to pass them here for uniform distribution of
+            items in the expectation.
+        :param seed: the random seed, ensures deterministic order across multiple iterations.
+        :param max_open_streams: the number of iterables that can be open simultaneously at any given time.
+        """
+        return cls(
+            LazyInfiniteApproximateMultiplexer(
+                *manifests,
+                weights=weights,
+                seed=seed,
+                max_open_streams=max_open_streams,
             )
         )
 
@@ -102,9 +155,9 @@ class AlgorithmMixin(LazyMixin, Iterable):
         if self.is_lazy:
             return cls(LazyShuffler(self.data, buffer_size=buffer_size, rng=rng))
         else:
-            ids = list(self.ids)
-            rng.shuffle(ids)
-            return cls({id_: self[id_] for id_ in ids})
+            new: List = self.data.copy()
+            rng.shuffle(new)
+            return cls(new)
 
     def repeat(self, times: Optional[int] = None, preserve_id: bool = False):
         """
@@ -134,8 +187,10 @@ class Dillable:
     If ``dill`` is not installed, it defers to what ``pickle`` does by default.
     """
 
+    _ENABLED_VALUES = {"1", "True", "true", "yes"}
+
     def __getstate__(self):
-        if is_module_available("dill"):
+        if is_dill_enabled():
             import dill
 
             return dill.dumps(self.__dict__)
@@ -143,7 +198,7 @@ class Dillable:
             return self.__dict__
 
     def __setstate__(self, state):
-        if is_module_available("dill"):
+        if is_dill_enabled():
             import dill
 
             self.__dict__ = dill.loads(state)
@@ -151,24 +206,40 @@ class Dillable:
             self.__dict__ = state
 
 
-class ImitatesDict(Dillable):
+def is_dill_enabled(_ENABLED_VALUES=frozenset(("1", "True", "true", "yes"))) -> bool:
+    """Returns bool indicating if dill-based pickling in Lhotse is enabled or not."""
+    return (
+        is_module_available("dill")
+        and os.environ.get("LHOTSE_DILL_ENABLED", "0") in _ENABLED_VALUES
+    )
+
+
+def set_dill_enabled(value: bool) -> None:
+    """Enable or disable dill-based pickling in Lhotse."""
+    assert is_module_available("dill"), (
+        "Cannot enable dill because dill is not installed. "
+        "Please run 'pip install dill' and try again."
+    )
+    # We use os.environ here so that sub-processes / forks will inherit this value
+    os.environ["LHOTSE_DILL_ENABLED"] = "1" if value else "0"
+
+
+@contextmanager
+def dill_enabled(value: bool):
     """
-    Helper base class for lazy iterators defined below.
-    It exists to make them drop-in replacements for data-holding dicts
-    in Lhotse's CutSet, RecordingSet, etc. classes.
+    Context manager that overrides the setting of Lhotse's dill-backed pickling
+    and restores the previous value after exit.
+
+    Example::
+
+        >>> import pickle
+        ... with dill_enabled(True):
+        ...    pickle.dump(CutSet(...).filter(lambda c: c.duration < 5), open("cutset.pickle", "wb"))
     """
-
-    def __iter__(self):
-        raise NotImplemented
-
-    def values(self):
-        yield from self
-
-    def keys(self):
-        return (item.id for item in self)
-
-    def items(self):
-        return ((item.id, item) for item in self)
+    previous = is_dill_enabled()
+    set_dill_enabled(value)
+    yield
+    set_dill_enabled(previous)
 
 
 class LazyJsonlIterator:
@@ -182,10 +253,14 @@ class LazyJsonlIterator:
         self._len = None
 
     def __iter__(self):
+        tot = 0
         with open_best(self.path, "r") as f:
             for line in f:
                 data = decode_json_line(line)
                 yield data
+                tot += 1
+        if self._len is None:
+            self._len = tot
 
     def __len__(self) -> int:
         if self._len is None:
@@ -193,7 +268,7 @@ class LazyJsonlIterator:
         return self._len
 
 
-class LazyManifestIterator(ImitatesDict):
+class LazyManifestIterator(Dillable):
     """
     LazyManifestIterator provides the ability to read Lhotse objects from a
     JSONL file on-the-fly, without reading its full contents into memory.
@@ -222,7 +297,7 @@ class LazyManifestIterator(ImitatesDict):
         return LazyIteratorChain(self, other)
 
 
-class LazyIteratorChain(ImitatesDict):
+class LazyIteratorChain(Dillable):
     """
     A thin wrapper over multiple iterators that enables to combine lazy manifests
     in Lhotse. It iterates all underlying iterables sequentially.
@@ -275,7 +350,7 @@ class LazyIteratorChain(ImitatesDict):
         return LazyIteratorChain(self, other)
 
 
-class LazyIteratorMultiplexer(ImitatesDict):
+class LazyIteratorMultiplexer(Dillable):
     """
     A wrapper over multiple iterators that enables to combine lazy manifests in Lhotse.
     During iteration, unlike :class:`.LazyIteratorChain`, :class:`.LazyIteratorMultiplexer`
@@ -292,7 +367,7 @@ class LazyIteratorMultiplexer(ImitatesDict):
         *iterators: Iterable,
         stop_early: bool = False,
         weights: Optional[List[Union[int, float]]] = None,
-        seed: int = 0,
+        seed: Union[int, Literal["trng"]] = 0,
     ) -> None:
         self.iterators = list(iterators)
         self.stop_early = stop_early
@@ -310,7 +385,7 @@ class LazyIteratorMultiplexer(ImitatesDict):
         assert len(self.iterators) == len(self.weights)
 
     def __iter__(self):
-        rng = random.Random(self.seed)
+        rng = build_rng(self.seed)
         iters = [iter(it) for it in self.iterators]
         exhausted = [False for _ in range(len(iters))]
 
@@ -344,7 +419,128 @@ class LazyIteratorMultiplexer(ImitatesDict):
         return LazyIteratorChain(self, other)
 
 
-class LazyShuffler(ImitatesDict):
+class LazyInfiniteApproximateMultiplexer(Dillable):
+    """
+    A variant of :class:`.LazyIteratorMultiplexer` that allows to control the number of
+    iterables that are simultaneously open.
+
+    It is useful for large-scale data sets where opening multiple file handles in
+    many processes leads to exhaustion of the operating system resources.
+
+    If the data sets are sharded, it is recommended to pass each shard as a separate iterator
+    when creating objects of this class. It is OK to assign a dataset-level weight to each shard
+    (e.g., if a dataset has a weight of 0.5, assign weight 0.5 to each of its shards).
+
+    There are several differences between this class and :class:`.LazyIteratorMultiplexer`:
+    * Objects of this class are infinite iterators.
+    * We hold a list of ``max_open_streams`` open iterators at any given time.
+        This list is filled by sampling input iterators with replacement.
+
+    These differences are necessary to guarantee the weighted sampling property.
+    If we did not sample with replacement or make it infinite, we would simply
+    exhaust highly-weighted iterators towards the beginning of each "epoch"
+    and keep sampling only lowly-weighted iterators towards the end of each "epoch".
+    """
+
+    def __init__(
+        self,
+        *iterators: Iterable,
+        stop_early: bool = False,
+        weights: Optional[List[Union[int, float]]] = None,
+        seed: Union[int, Literal["trng"]] = 0,
+        max_open_streams: Optional[int] = None,
+    ) -> None:
+        self.iterators = list(iterators)
+        self.stop_early = stop_early
+        self.seed = seed
+        self.max_open_streams = max_open_streams
+        if max_open_streams is None or max_open_streams > len(self.iterators):
+            self.max_open_streams = len(self.iterators)
+
+        assert len(self.iterators) > 0
+        self.weights = weights
+        if weights is None:
+            self.weights = [1] * len(self.iterators)
+        assert len(self.iterators) == len(self.weights)
+        assert (
+            self.max_open_streams is None or self.max_open_streams >= 1
+        ), f"{self.max_open_streams=}"
+
+    def __iter__(self):
+        """
+        Assumptions
+        - we have N streams but can only open M at the time (M < N)
+        - the streams are finite
+        - each stream needs to be "short" to ensure the mux property
+        - each stream may be interpreted as a shard belonging to some larger group of streams
+          (e.g. multiple shards of a given dataset).
+        """
+        rng = build_rng(self.seed)
+
+        def shuffled_streams():
+            # Create an infinite iterable of our streams.
+            # Assume N is "small" enough that shuffling it will be quick
+            #
+            # we need to incorporate weights into shuffling here
+            # and sample iterators with replacement.
+            # consider it0=[shard00, shard01] with weight 0.95
+            # and      it1=[shard10, shard11] with weight 0.05
+            # so we have 4 streams [shard{01}{01}]
+            # if we just shuffle randomly and sample without replacement
+            # per each "epoch" (epoch = 4 shards) then we would have
+            # ignored the weights because we'll just exhaust it0 shards
+            # towards the beginning of an "epoch" and then keep yielding
+            # from it1 shards until the epoch is finished and we can sample
+            # from it0 again...
+            indexes = list(range(len(self.iterators)))
+            while True:
+                selected = rng.choices(indexes, self.weights, k=1)[0]
+                yield self.iterators[selected], self.weights[selected]
+
+        # Initialize an infinite sequence of finite streams.
+        # It is sampled with weights and replacement from ``self.iterators``,
+        # which are of length N.
+        stream_source = shuffled_streams()
+
+        # Sample the first M active streams to be multiplexed.
+        # As streams get depleted, we will replace them with
+        # new streams sampled from the stream source.
+        active_streams = [None] * self.max_open_streams
+        active_weights = [None] * self.max_open_streams
+        stream_indexes = list(range(self.max_open_streams))
+
+        def sample_new_stream_at(pos: int) -> None:
+            sampled_stream, sampled_weight = next(stream_source)
+            active_streams[pos] = iter(sampled_stream)
+            active_weights[pos] = sampled_weight
+
+        for stream_pos in range(self.max_open_streams):
+            sample_new_stream_at(stream_pos)
+
+        # The actual multiplexing loop.
+        while True:
+            # Select a stream from the currently active streams.
+            # We actually sample an index so that we know which position
+            # to replace if a stream is exhausted.
+            stream_pos = rng.choices(
+                stream_indexes,
+                weights=active_weights if sum(active_weights) > 0 else None,
+                k=1,
+            )[0]
+            selected = active_streams[stream_pos]
+            try:
+                # Sample from the selected stream.
+                item = next(selected)
+                yield item
+            except StopIteration:
+                # The selected stream is exhausted. Replace it with another one,
+                # and return a sample from the newly opened stream.
+                sample_new_stream_at(stream_pos)
+                item = next(active_streams[stream_pos])
+                yield item
+
+
+class LazyShuffler(Dillable):
     """
     A wrapper over an iterable that enables lazy shuffling.
     The shuffling algorithm is reservoir-sampling based.
@@ -377,7 +573,7 @@ class LazyShuffler(ImitatesDict):
         return LazyIteratorChain(self, other)
 
 
-class LazyFilter(ImitatesDict):
+class LazyFilter(Dillable):
     """
     A wrapper over an iterable that enables lazy filtering.
     It works like Python's `filter` built-in by applying the filter predicate
@@ -408,7 +604,7 @@ class LazyFilter(ImitatesDict):
         return LazyIteratorChain(self, other)
 
     def __len__(self) -> int:
-        raise NotImplementedError(
+        raise TypeError(
             "LazyFilter does not support __len__ because it would require "
             "iterating over the whole iterator, which is not possible in a lazy fashion. "
             "If you really need to know the length, convert to eager mode first using "
@@ -416,7 +612,7 @@ class LazyFilter(ImitatesDict):
         )
 
 
-class LazyMapper(ImitatesDict):
+class LazyMapper(Dillable):
     """
     A wrapper over an iterable that enables lazy function evaluation on each item.
     It works like Python's `map` built-in by applying a callable ``fn``
@@ -448,7 +644,7 @@ class LazyMapper(ImitatesDict):
         return LazyIteratorChain(self, other)
 
 
-class LazyFlattener(ImitatesDict):
+class LazyFlattener(Dillable):
     """
     A wrapper over an iterable of collections that flattens it to an iterable of items.
 
@@ -469,7 +665,7 @@ class LazyFlattener(ImitatesDict):
         return LazyIteratorChain(self, other)
 
     def __len__(self) -> int:
-        raise NotImplementedError(
+        raise TypeError(
             "LazyFlattener does not support __len__ because it would require "
             "iterating over the whole iterator, which is not possible in a lazy fashion. "
             "If you really need to know the length, convert to eager mode first using "
@@ -477,7 +673,7 @@ class LazyFlattener(ImitatesDict):
         )
 
 
-class LazyRepeater(ImitatesDict):
+class LazyRepeater(Dillable):
     """
     A wrapper over an iterable that enables to repeat it N times or infinitely (default).
     """
@@ -512,7 +708,7 @@ class LazyRepeater(ImitatesDict):
         return LazyIteratorChain(self, other)
 
 
-class LazySlicer(ImitatesDict):
+class LazySlicer(Dillable):
     """
     A wrapper over an iterable that enables selecting k-th element every n elements.
     """
@@ -534,7 +730,7 @@ class LazySlicer(ImitatesDict):
         return LazyIteratorChain(self, other)
 
     def __len__(self) -> int:
-        raise NotImplementedError(
+        raise TypeError(
             "LazySlicer does not support __len__ because it would require "
             "iterating over the whole iterator, which is not possible in a lazy fashion. "
             "If you really need to know the length, convert to eager mode first using "

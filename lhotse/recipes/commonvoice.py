@@ -18,6 +18,7 @@ import warnings
 from collections import defaultdict
 from concurrent.futures.process import ProcessPoolExecutor
 from contextlib import contextmanager
+from multiprocessing import get_context as mp_get_context
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -30,6 +31,7 @@ from lhotse import (
     validate_recordings_and_supervisions,
 )
 from lhotse.audio import Recording, RecordingSet
+from lhotse.qa import fix_manifests
 from lhotse.supervision import SupervisionSegment, SupervisionSet
 from lhotse.utils import Pathlike, is_module_available, resumable_download, safe_extract
 
@@ -197,7 +199,11 @@ def _prepare_part(
     tsv_path = lang_path / f"{part}.tsv"
 
     with disable_ffmpeg_torchaudio_info():
-        with ProcessPoolExecutor(num_jobs) as ex:
+        with ProcessPoolExecutor(
+            max_workers=num_jobs,
+            mp_context=mp_get_context("spawn"),
+        ) as ex:
+
             futures = []
             recordings = []
             supervisions = []
@@ -304,6 +310,12 @@ def prepare_commonvoice(
                 lang_path=lang_path,
                 num_jobs=num_jobs,
             )
+
+            # Fix manifests
+            recording_set, supervision_set = fix_manifests(
+                recording_set, supervision_set
+            )
+            validate_recordings_and_supervisions(recording_set, supervision_set)
 
             supervision_set.to_file(
                 output_dir / f"cv-{lang}_supervisions_{part}.jsonl.gz"

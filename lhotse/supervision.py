@@ -14,6 +14,8 @@ from typing import (
     Union,
 )
 
+from tqdm import tqdm
+
 from lhotse.lazy import AlgorithmMixin
 from lhotse.serialization import Serializable
 from lhotse.utils import (
@@ -26,7 +28,6 @@ from lhotse.utils import (
     exactly_one_not_null,
     fastcopy,
     ifnone,
-    index_by_id_and_check,
     is_equal_or_contains,
     overspans,
     perturb_num_samples,
@@ -244,12 +245,7 @@ class SupervisionSegment:
             speaker=self.speaker,
             gender=self.gender,
             custom=self.custom,
-            alignment={
-                type: [item.with_offset(offset=offset) for item in ali]
-                for type, ali in self.alignment.items()
-            }
-            if self.alignment
-            else None,
+            alignment=self.alignment,
         )
 
     def perturb_speed(
@@ -456,7 +452,7 @@ class SupervisionSegment:
 
         return SupervisionSegment(**data)
 
-    def __setattr__(self, key: str, value: Any):
+    def __setattr__(self, key: str, value: Any) -> None:
         """
         This magic function is called when the user tries to set an attribute.
         We use it as syntactic sugar to store custom attributes in ``self.custom``
@@ -466,8 +462,12 @@ class SupervisionSegment:
             super().__setattr__(key, value)
         else:
             custom = ifnone(self.custom, {})
-            custom[key] = value
-            self.custom = custom
+            if value is None:
+                custom.pop(key, None)
+            else:
+                custom[key] = value
+            if custom:
+                self.custom = custom
 
     def __getattr__(self, name: str) -> Any:
         """
@@ -492,16 +492,24 @@ class SupervisionSegment:
         except:
             raise AttributeError(f"No such attribute: {name}")
 
+    def __delattr__(self, key: str) -> None:
+        """Used to support ``del supervision.custom_attr`` syntax."""
+        if key in self.__dataclass_fields__:
+            super().__delattr__(key)
+        if self.custom is None or key not in self.custom:
+            raise AttributeError(f"No such member: '{key}'")
+        del self.custom[key]
+
 
 class SupervisionSet(Serializable, AlgorithmMixin):
     """
     :class:`~lhotse.supervision.SupervisionSet` represents a collection of segments containing some
-    supervision information (see :class:`~lhotse.supervision.SupervisionSegment`),
-    that are indexed by segment IDs.
+    supervision information (see :class:`~lhotse.supervision.SupervisionSegment`).
 
-    It acts as a Python ``dict``, extended with an efficient ``find`` operation that indexes and caches
+    It acts as a Python ``list``, extended with an efficient ``find`` operation that indexes and caches
     the supervision segments in an interval tree.
     It allows to quickly find supervision segments that correspond to a specific time interval.
+    However, it can also work with lazy iterables.
 
     When coming from Kaldi, think of :class:`~lhotse.supervision.SupervisionSet` as a ``segments`` file on steroids,
     that may also contain *text*, *utt2spk*, *utt2gender*, *utt2dur*, etc.
@@ -539,9 +547,7 @@ class SupervisionSet(Serializable, AlgorithmMixin):
             >>> shuffled = sups.shuffle()
     """
 
-    def __init__(
-        self, segments: Optional[Mapping[str, SupervisionSegment]] = None
-    ) -> None:
+    def __init__(self, segments: Optional[Iterable[SupervisionSegment]] = None) -> None:
         self.segments = ifnone(segments, {})
 
     def __eq__(self, other: "SupervisionSet") -> bool:
@@ -556,11 +562,11 @@ class SupervisionSet(Serializable, AlgorithmMixin):
 
     @property
     def ids(self) -> Iterable[str]:
-        return self.segments.keys()
+        return (s.id for s in self)
 
     @staticmethod
     def from_segments(segments: Iterable[SupervisionSegment]) -> "SupervisionSet":
-        return SupervisionSet(segments=index_by_id_and_check(segments))
+        return SupervisionSet(list(segments))
 
     from_items = from_segments
 
@@ -637,7 +643,11 @@ class SupervisionSet(Serializable, AlgorithmMixin):
         return SupervisionSet.from_segments(segments)
 
     def with_alignment_from_ctm(
-        self, ctm_file: Pathlike, type: str = "word", match_channel: bool = False
+        self,
+        ctm_file: Pathlike,
+        type: str = "word",
+        match_channel: bool = False,
+        verbose: bool = False,
     ) -> "SupervisionSet":
         """
         Add alignments from CTM file to the supervision set.
@@ -645,14 +655,25 @@ class SupervisionSet(Serializable, AlgorithmMixin):
         :param ctm: Path to CTM file.
         :param type: Alignment type (optional, default = `word`).
         :param match_channel: if True, also match channel between CTM and SupervisionSegment
+        :param verbose: if True, show progress bar
         :return: A new SupervisionSet with AlignmentItem objects added to the segments.
         """
         ctm_words = []
+        # Sometimes the channels may not be integers, so we map them here.
+        channel_to_int = {}
         with open(ctm_file) as f:
+            f = tqdm(f, desc="Reading words from CTM file") if verbose else f
             for line in f:
-                reco_id, channel, start, duration, symbol = line.strip().split()
+                reco_id, channel, start, duration, symbol, *score = line.strip().split()
                 ctm_words.append(
-                    (reco_id, int(channel), float(start), float(duration), symbol)
+                    (
+                        reco_id,
+                        int(channel),
+                        float(start),
+                        float(duration),
+                        symbol,
+                        float(score[0]) if score else None,
+                    )
                 )
         ctm_words = sorted(ctm_words, key=lambda x: (x[0], x[2]))
         reco_to_ctm = defaultdict(
@@ -661,11 +682,20 @@ class SupervisionSet(Serializable, AlgorithmMixin):
         segments = []
         num_total = len(ctm_words)
         num_overspanned = 0
-        for reco_id in set([s.recording_id for s in self]):
+        recordings = set([s.recording_id for s in self])
+        recordings = (
+            tqdm(recordings, desc="Adding alignments") if verbose else recordings
+        )
+        for reco_id in recordings:
             if reco_id in reco_to_ctm:
                 for seg in self.find(recording_id=reco_id):
                     alignment = [
-                        AlignmentItem(symbol=word[4], start=word[2], duration=word[3])
+                        AlignmentItem(
+                            symbol=word[4],
+                            start=word[2],
+                            duration=word[3],
+                            score=word[5],
+                        )
                         for word in reco_to_ctm[reco_id]
                         if overspans(seg, TimeSpan(word[2], word[2] + word[3]))
                         and (seg.channel == word[1] or not match_channel)
@@ -697,9 +727,14 @@ class SupervisionSet(Serializable, AlgorithmMixin):
                 if type in s.alignment:
                     for ali in s.alignment[type]:
                         c = s.channel[0] if isinstance(s.channel, list) else s.channel
-                        f.write(
-                            f"{s.recording_id} {c} {ali.start:.02f} {ali.duration:.02f} {ali.symbol}\n"
-                        )
+                        if ali.score is None:
+                            f.write(
+                                f"{s.recording_id} {c} {ali.start:.02f} {ali.duration:.02f} {ali.symbol}\n"
+                            )
+                        else:
+                            f.write(
+                                f"{s.recording_id} {c} {ali.start:.02f} {ali.duration:.02f} {ali.symbol} {ali.score:.02f}\n"
+                            )
 
     def to_dicts(self) -> Iterable[dict]:
         return (s.to_dict() for s in self)
@@ -767,19 +802,11 @@ class SupervisionSet(Serializable, AlgorithmMixin):
         if first is not None:
             assert first > 0
             out = SupervisionSet.from_items(islice(self, first))
-            if len(out) < first:
-                logging.warning(
-                    f"SupervisionSet has only {len(out)} items but first {first} were requested."
-                )
             return out
 
         if last is not None:
             assert last > 0
             if last > len(self):
-                logging.warning(
-                    f"SupervisionSet has only {len(self)} items but last {last} required; "
-                    f"not doing anything."
-                )
                 return self
             return SupervisionSet.from_segments(
                 islice(self, len(self) - last, len(self))
@@ -863,24 +890,25 @@ class SupervisionSet(Serializable, AlgorithmMixin):
     def __repr__(self) -> str:
         return f"SupervisionSet(len={len(self)})"
 
-    def __getitem__(self, sup_id_or_index: Union[int, str]) -> SupervisionSegment:
-        if isinstance(sup_id_or_index, str):
-            return self.segments[sup_id_or_index]
-        # ~100x faster than list(dict.values())[index] for 100k elements
-        return next(
-            val
-            for idx, val in enumerate(self.segments.values())
-            if idx == sup_id_or_index
-        )
+    def __getitem__(self, index_or_id: Union[int, str]) -> SupervisionSegment:
+        try:
+            return self.segments[index_or_id]  # int passed, eager manifest, fast
+        except TypeError:
+            # either lazy manifest or str passed, both are slow
+            if self.is_lazy:
+                return next(item for idx, item in enumerate(self) if idx == index_or_id)
+            else:
+                # string id passed, support just for backward compatibility, not recommended
+                return next(item for item in self if item.id == index_or_id)
 
-    def __contains__(self, item: Union[str, SupervisionSegment]) -> bool:
-        if isinstance(item, str):
-            return item in self.segments
+    def __contains__(self, other: Union[str, SupervisionSegment]) -> bool:
+        if isinstance(other, str):
+            return any(other == item.id for item in self)
         else:
-            return item.id in self.segments
+            return any(other.id == item.id for item in self)
 
     def __iter__(self) -> Iterable[SupervisionSegment]:
-        return iter(self.segments.values())
+        yield from self.segments
 
     def __len__(self) -> int:
         return len(self.segments)
