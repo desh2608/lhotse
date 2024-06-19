@@ -37,7 +37,7 @@ Standard data preparation recipes
 We provide a number of standard data preparation recipes. By that, we mean a collection of a Python function +
 a CLI tool that create the manifests given a corpus directory.
 
-.. list-table:: Currently supported corpora
+.. list-table:: Currently supported audio corpora
   :widths: 30 50
   :header-rows: 1
 
@@ -61,8 +61,12 @@ a CLI tool that create the manifests given a corpus directory.
     - :func:`lhotse.recipes.prepare_aspire`
   * - ATCOSIM
     - :func:`lhotse.recipes.prepare_atcosim`
+  * - AudioMNIST
+    - :func:`lhotse.recipes.prepare_audio_mnist`
   * - BABEL
     - :func:`lhotse.recipes.prepare_single_babel_language`
+  * - Bengali.AI Speech
+    - :func:`lhotse.recipes.prepare_bengaliai_speech`
   * - BUT ReverbDB
     - :func:`lhotse.recipes.prepare_but_reverb_db`
   * - BVCC / VoiceMOS Challenge
@@ -103,6 +107,8 @@ a CLI tool that create the manifests given a corpus directory.
     - :func:`lhotse.recipes.prepare_fisher_english`
   * - Fisher Spanish
     - :func:`lhotse.recipes.prepare_fisher_spanish`
+  * - Fluent Speech Commands
+    - :func:`lhotse.recipes.slu`
   * - GALE Arabic Broadcast Speech
     - :func:`lhotse.recipes.prepare_gale_arabic`
   * - GALE Mandarin Broadcast Speech
@@ -117,8 +123,14 @@ a CLI tool that create the manifests given a corpus directory.
     - :func:`lhotse.recipes.prepare_hifitts`
   * - HI-MIA (including HI-MIA-CW)
     - :func:`lhotse.recipes.prepare_himia`
+  * - ICMC-ASR
+    - :func:`lhotse.recipes.prepare_icmcasr`
   * - ICSI
     - :func:`lhotse.recipes.prepare_icsi`
+  * - IWSLT22_Ta
+    - :func:`lhotse.recipes.prepare_iwslt22_ta`
+  * - KeSpeech
+    - :func:`lhotse.recipes.prepare_kespeech`
   * - L2 Arctic
     - :func:`lhotse.recipes.prepare_l2_arctic`
   * - LibriCSS
@@ -133,6 +145,8 @@ a CLI tool that create the manifests given a corpus directory.
     - :func:`lhotse.recipes.prepare_librittsr`
   * - LJ Speech
     - :func:`lhotse.recipes.prepare_ljspeech`
+  * - Medical
+    - :func:`lhotse.recipes.prepare_medical`
   * - MiniLibriMix
     - :func:`lhotse.recipes.prepare_librimix`
   * - MTEDx
@@ -161,12 +175,18 @@ a CLI tool that create the manifests given a corpus directory.
     - :func:`lhotse.recipes.prepare_tedlium`
   * - TIMIT
     - :func:`lhotse.recipes.prepare_timit`
+  * - This American Life
+    - :func:`lhotse.recipes.prepare_this_american_life`
   * - UWB-ATCC
     - :func:`lhotse.recipes.prepare_uwb_atcc`
   * - VCTK
     - :func:`lhotse.recipes.prepare_vctk`
   * - VoxCeleb
     - :func:`lhotse.recipes.prepare_voxceleb`
+  * - VoxConverse
+    - :func:`lhotse.recipes.prepare_voxconverse`
+  * - VoxPopuli
+    - :func:`lhotse.recipes.prepare_voxpopuli`
   * - WenetSpeech
     - :func:`lhotse.recipes.prepare_wenet_speech`
   * - YesNo
@@ -178,6 +198,15 @@ a CLI tool that create the manifests given a corpus directory.
   * - XBMU-AMDO31
     - :func:`lhotse.recipes.xbmu_amdo31`
 
+
+.. list-table:: Currently supported video corpora
+  :widths: 30 50
+  :header-rows: 1
+
+  * - Corpus name
+    - Function
+  * - Grid Audio-Visual Speech Corpus
+    - :func:`lhotse.recipes.prepare_grid`
 
 Adding new corpora
 ------------------

@@ -1,15 +1,18 @@
+import os
 import warnings
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from math import isclose
-from typing import Any, Callable, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Literal, Optional, Tuple, Union
 
+import torch
 from torch import distributed as dist
 from torch.utils.data import Sampler
 
 from lhotse.cut import Cut, CutSet
 from lhotse.lazy import Dillable
-from lhotse.utils import Seconds, exactly_one_not_null, is_none_or_gt
+from lhotse.manipulation import combine
+from lhotse.utils import Seconds, ifnone, is_none_or_gt
 
 
 class CutSampler(Sampler, Dillable):
@@ -55,7 +58,7 @@ class CutSampler(Sampler, Dillable):
         drop_last: bool = False,
         world_size: Optional[int] = None,
         rank: Optional[int] = None,
-        seed: int = 0,
+        seed: Union[int, Literal["randomized", "trng"]] = 0,
     ) -> None:
         """
         :param shuffle: When ``True``, the cuts will be shuffled at the start of iteration.
@@ -84,6 +87,7 @@ class CutSampler(Sampler, Dillable):
         self._maybe_init_distributed(world_size=world_size, rank=rank)
         # By default, self._filter_fn passes every Cut through.
         self._filter_fn: Callable[[Cut], bool] = _filter_nothing()
+        self._transforms = []
 
     @property
     def diagnostics(self):
@@ -99,12 +103,22 @@ class CutSampler(Sampler, Dillable):
             assert world_size >= 1
         if rank is not None:
             assert rank >= 0
-        if not dist.is_available() or not dist.is_initialized():
-            self.world_size = 1 if world_size is None else world_size
-            self.rank = 0 if rank is None else rank
-            return
-        self.world_size = dist.get_world_size() if world_size is None else world_size
-        self.rank = dist.get_rank() if rank is None else rank
+
+        # Order of precedence:
+        # 1. When world size or rank are explicitly provided, we will use them.
+        # 2. Next, check WORLD_SIZE and RANK env variables; yes? use them.
+        # 3. Next, check if torch.distributed is initialized and has them set; yes? use them.
+        # 4. If none of those are available, rank=0 and world_size=1.
+        if "WORLD_SIZE" in os.environ and "RANK" in os.environ:
+            # If deepspeed launcher is being used, it will set the env variables automatically.
+            self.world_size = ifnone(world_size, int(os.environ["WORLD_SIZE"]))
+            self.rank = ifnone(rank, int(os.environ["RANK"]))
+        elif dist.is_available() and dist.is_initialized():
+            self.world_size = ifnone(world_size, dist.get_world_size())
+            self.rank = ifnone(rank, dist.get_rank())
+        else:
+            self.world_size = ifnone(world_size, 1)
+            self.rank = ifnone(rank, 0)
         assert self.rank < self.world_size
 
     def set_epoch(self, epoch: int) -> None:
@@ -122,7 +136,7 @@ class CutSampler(Sampler, Dillable):
         self.epoch = epoch
         self.diagnostics.set_epoch(epoch)
 
-    def filter(self, predicate: Callable[[Cut], bool]) -> None:
+    def filter(self, predicate: Callable[[Cut], bool]) -> "CutSampler":
         """
         Add a constraint on individual cuts that has to be satisfied to consider them.
 
@@ -139,6 +153,15 @@ class CutSampler(Sampler, Dillable):
             self._filter_fn = predicate
         else:
             self._filter_fn = _and(self._filter_fn, predicate)
+        return self
+
+    def map(self, fn: Callable[[CutSet], CutSet]) -> "CutSampler":
+        """Apply ``fn`` to each mini-batch of ``CutSet`` before yielding it."""
+        assert callable(
+            fn
+        ), f"Expected a callable accepting and returning a CutSet, received: '{fn}'"
+        self._transforms.append(fn)
+        return self
 
     def state_dict(self) -> Dict[str, Any]:
         """
@@ -257,25 +280,53 @@ class CutSampler(Sampler, Dillable):
         # worker:
         # Every time a next batch is required, we will sample self.world_size batches first,
         # and then return the one at position self.rank.
-        # This way, if any of the batches raises StopIteration, we'll know to stop early
-        # when a given batch was available for one of the nodes, but not for the others.
+        # When world_size=1 (i.e., single device) this doesn't change anything.
+        # When world_size>1 (i.e., multi-GPU) the behavior depends on the setting of ``drop_last``.
+        # To prevent some rank from terminating the iteration earlier than others (and typically going into deadlock),
+        # we will either:
+        # a) [drop_last=False, default] redistribute the examples to yield a (partial) mini-batch in each rank
+        #       (if there's not enough examples, we'll duplicate some);
+        # b) [drop_last=True] we'll stop early and discard the mini-batches for all ranks that had them.
+        #       Note that drop_last=True implies the last partial mini-batch would also be discarded in a
+        #       single-GPU setting, to be consistent with PyTorch's drop_last logic.
         batches = []
         for _ in range(self.world_size):
             try:
                 batch = self._next_batch()
+                batches.append(batch)
             except StopIteration:
-                if self.drop_last:
+                if self.world_size == 1 or self.drop_last:
                     # The users indicated they want an equal number of batches on all
                     # ranks and are ready to lose some data: drop remainder batches.
                     raise
-                # We have to delay raising StopIteration to let some the sampler
-                # yield the last N batches (when N < world_size - 1).
-                batch = None
-            batches.append(batch)
+                # If we got here, it means there's one or more empty mini-batch that
+                # hasn't triggered StopIteration. This scenario is handled below.
+
+        if len(batches) == 0:
+            raise StopIteration()  # normal end of iteration when drop_last=False
+        elif len(batches) != self.world_size:
+            # "From each according to his ability, to each according to his needs."
+            # We hit the end of data and at least one rank is left without a mini-batch.
+            # Since we have access to the mini-batches in all ranks here, we can
+            # deterministically re-distribute the examples to yield a partial mini-batch
+            # in every rank (i.e., the result of the redistribution doesn't depend on rank).
+            # The only problematic scenario is when the number of examples is smaller
+            # than world size. In these cases, we will duplicate the first ``n_diff``
+            # examples so that each rank has exactly 1 example in its mini-batch.
+            combined = combine([b for b in batches if b is not None])
+            chunk = 0
+            while (diff := self.world_size - len(combined)) > 0:
+                combined = combined + combined.subset(first=diff).modify_ids(
+                    mark_as_duplicate(chunk)
+                )
+                chunk += 1
+            batches = combined.split(self.world_size)
+
         selected = batches[self.rank]
-        if selected is None:
-            raise StopIteration
         self._log_diagnostics(selected)
+        for tfn in self._transforms:
+            selected = tfn(selected)
+        attach_dataloading_info(selected, rank=self.rank, world_size=self.world_size)
         return selected
 
     def _log_diagnostics(self, batch: Union[CutSet, Tuple[CutSet, ...]]) -> None:
@@ -289,6 +340,30 @@ class CutSampler(Sampler, Dillable):
     def get_report(self) -> str:
         """Returns a string describing the statistics of the sampling process so far."""
         return self.diagnostics.get_report()
+
+
+def mark_as_duplicate(iteration: int) -> Callable[[str], str]:
+    def inner(cut_id: str) -> str:
+        return f"{cut_id}_dup{iteration}"
+
+    return inner
+
+
+def attach_dataloading_info(cuts: CutSet, rank: int, world_size: int) -> None:
+    """
+    Attaches diagnostic info about dataloading to each cut under ``dataloading_info`` custom field.
+    This information contains the rank, world_size, and worker_id.
+    If the training is not distributed, rank and world_size are 0 and 1.
+    If the num_workers argument in DataLoader was 0, worker_id is None.
+    """
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is None:
+        worker_id = None
+    else:
+        worker_id = worker_info.id
+    info = {"rank": rank, "world_size": world_size, "worker_id": worker_id}
+    for cut in cuts:
+        cut.dataloading_info = info
 
 
 @dataclass
@@ -365,10 +440,9 @@ class TimeConstraint:
         if self.max_cuts is not None and self.num_cuts >= self.max_cuts:
             return True
 
-        thresh = self.longest_seen
-
         if self.max_duration is not None:
-            return self.current + thresh >= self.max_duration - 1e-3  # float precision
+            effective_duration = (self.num_cuts + 1) * self.longest_seen
+            return effective_duration > self.max_duration
         return False
 
     def reset(self) -> None:
