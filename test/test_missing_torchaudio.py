@@ -1,4 +1,5 @@
 import importlib
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -30,6 +31,20 @@ def test_lhotse_cutset_works():
 
 
 @notorchaudio
+def test_lhotse_cutset_exportable_to_shar(tmp_path: Path):
+    import lhotse
+
+    cuts = lhotse.CutSet.from_file("test/fixtures/libri/cuts.json")
+    cuts.to_shar(tmp_path, fields={"recording": "wav"})
+    cuts_shar = lhotse.CutSet.from_shar(in_dir=tmp_path)
+    for lhs, rhs in zip(cuts, cuts_shar):
+        assert lhs.id == rhs.id
+        lhsa = lhs.load_audio()
+        rhsa = rhs.load_audio()
+        np.testing.assert_array_equal(lhsa, rhsa)
+
+
+@notorchaudio
 def test_lhotse_load_audio():
     import lhotse
 
@@ -58,6 +73,25 @@ def test_lhotse_audio_in_memory():
 
     cuts = lhotse.CutSet.from_file("test/fixtures/libri/cuts.json")
     cut = cuts[0]
+    cut = cut.move_to_memory()
+    audio = cut.load_audio()
+    assert isinstance(audio, np.ndarray)
+
+
+@notorchaudio
+def test_lhotse_audio_in_memory_from_wav(tmp_path):
+    import soundfile as sf
+
+    import lhotse
+
+    path = str(tmp_path / "test.wav")
+    audio = np.random.randint(0, 2**16, size=(16000,)) / 2**16
+    sf.write(path, audio, samplerate=16000)
+
+    cut = lhotse.Recording.from_file(path).to_cut()
+    cut = cut.truncate(
+        duration=cut.duration / 2
+    )  # force move_to_memory to go through transcoding
     cut = cut.move_to_memory()
     audio = cut.load_audio()
     assert isinstance(audio, np.ndarray)
