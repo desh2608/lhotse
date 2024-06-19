@@ -4,15 +4,16 @@ About the librilight corpus
 Libri-light is a benchmark for the training of automatic speech recognition (ASR)
 systems with limited or no supervision.
 
-It contains a large dataset of 60K hours of unlabelled speech from audiobooks in 
+It contains a large dataset of 60K hours of unlabelled speech from audiobooks in
 English and a small labelled dataset (10h, 1h, and 10 min) plus metrics,
 trainable baseline models, and pretrained models that use these datasets.
 
-It is covered in more detail at https://arxiv.org/abs/1912.07875.
+It is covered in more detail at https://arxiv.org/abs/1912.07875
 
 This data is very huge - please download manually at LIBRILIGHT_URL.
 """
 
+import json
 import logging
 import os
 from collections import defaultdict
@@ -23,9 +24,10 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 from tqdm.auto import tqdm
 
 from lhotse.audio import Recording, RecordingSet
+from lhotse.qa import fix_manifests, validate_recordings_and_supervisions
 from lhotse.recipes.utils import manifests_exist
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike
+from lhotse.utils import Pathlike, add_durations
 
 LIBRILIGHT = ("small", "medium", "large")
 
@@ -41,28 +43,43 @@ def _parse_utterance(
     audio_path: Pathlike,
 ) -> Optional[Tuple[Recording, SupervisionSegment]]:
     file_name = str(audio_path).replace(".flac", "").replace(str(corpus_dir) + "/", "")
-    speaker = str(audio_path).split("/")[-3]
     audio_path = audio_path.resolve()
 
     if not audio_path.is_file():
         logging.warning(f"No such file: {audio_path}")
         return None
 
+    audio_info_path = str(audio_path).replace("flac", "json")
+    with open(audio_info_path) as f:
+        audio_infos = json.load(f)
+        speaker = audio_infos["speaker"]
+        vad_infos = audio_infos["voice_activity"]
+
     recording = Recording.from_file(
         path=audio_path,
         recording_id=file_name,
     )
-    segment = SupervisionSegment(
-        id=file_name,
-        recording_id=file_name,
-        start=0.0,
-        duration=recording.duration,
-        channel=0,
-        language="English",
-        speaker=speaker,
-    )
 
-    return recording, segment
+    segments = []
+    segment_seq = 0
+    sampling_rate = 16000
+    for vad_info in vad_infos:
+        segments.append(
+            SupervisionSegment(
+                id=file_name + "_" + str(segment_seq),
+                recording_id=file_name,
+                start=vad_info[0],
+                duration=add_durations(
+                    vad_info[1], -vad_info[0], sampling_rate=sampling_rate
+                ),
+                channel=0,
+                language="English",
+                speaker=speaker,
+            )
+        )
+        segment_seq += 1
+
+    return recording, segments
 
 
 def _prepare_subset(
@@ -91,12 +108,16 @@ def _prepare_subset(
             result = future.result()
             if result is None:
                 continue
-            recording, segment = result
+            recording, segments = result
             recordings.append(recording)
-            supervisions.append(segment)
+            supervisions.extend(segments)
 
         recording_set = RecordingSet.from_recordings(recordings)
         supervision_set = SupervisionSet.from_segments(supervisions)
+
+        # Fix manifests
+        recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
+        validate_recordings_and_supervisions(recording_set, supervision_set)
 
     return recording_set, supervision_set
 

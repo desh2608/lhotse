@@ -2,7 +2,7 @@ import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import click
 import tqdm
@@ -27,7 +27,7 @@ def shar():
     "-a",
     "--audio",
     default="none",
-    type=click.Choice(["none", "wav", "flac", "mp3"]),
+    type=click.Choice(["none", "wav", "flac", "mp3", "opus"]),
     help="Format in which to export audio (disabled by default, enabling will make a copy of the data)",
 )
 @click.option(
@@ -36,6 +36,13 @@ def shar():
     default="none",
     type=click.Choice(["none", "lilcom", "numpy"]),
     help="Format in which to export features (disabled by default, enabling will make a copy of the data)",
+)
+@click.option(
+    "-c",
+    "--custom",
+    multiple=True,
+    default=[],
+    help="Custom fields to export. Use syntax NAME:FORMAT, e.g.: -c target_recording:flac -c embedding:numpy. Use format options for audio and features depending on the custom fields type, or 'jsonl' for metadata.",
 )
 @click.option(
     "-s",
@@ -48,6 +55,11 @@ def shar():
     "--shuffle/--no-shuffle",
     default=True,
     help="Should we shuffle the cuts before splitting into shards.",
+)
+@click.option(
+    "--fault-tolerant/--fast-fail",
+    default=False,
+    help="Should we skip over cuts that failed to load data or raise an error.",
 )
 @click.option("--seed", default=0, type=int, help="Random seed.")
 @click.option(
@@ -64,8 +76,10 @@ def export(
     outdir: str,
     audio: str,
     features: str,
+    custom: List[str],
     shard_size: int,
     shuffle: bool,
+    fault_tolerant: bool,
     seed: int,
     num_jobs: int,
     verbose: bool,
@@ -92,6 +106,10 @@ def export(
         fields["recording"] = audio
     if features != "none":
         fields["features"] = features
+    if custom:
+        for item in custom:
+            key, fmt = item.split(":")
+            fields[key] = fmt
 
     Path(outdir).mkdir(parents=True, exist_ok=True)
     cuts.to_shar(
@@ -99,6 +117,7 @@ def export(
         fields=fields,
         shard_size=shard_size,
         num_jobs=num_jobs,
+        fault_tolerant=fault_tolerant,
         verbose=verbose,
     )
 
@@ -139,21 +158,28 @@ def compute_features(
     You can generate default feature extractor settings with:
     lhotse feat write-default-config --help
     """
-    shards = list(Path(shar_dir).glob("cuts.*.jsonl*"))
+    shards = [
+        {
+            "cuts": [p],
+            "recording": [p.with_name("".join(["recording", p.suffixes[0], ".tar"]))],
+        }
+        for p in Path(shar_dir).glob("cuts.*.jsonl*")
+    ]
     progbar = lambda x: x
     if verbose:
         click.echo(f"Computing features for {len(shards)} shards.")
-        progbar = partial(tqdm.tqdm, desc="Shard progress")
+        progbar = partial(tqdm.tqdm, desc="Shard progress", total=len(shards))
 
     futures = []
     with ProcessPoolExecutor(num_jobs) as ex:
         for shard in shards:
-            shard_idx = shard.name.split(".")[1]
-            output_path = shard.with_name(f"features.{shard_idx}.tar")
+            cuts_path = shard["cuts"][0]
+            shard_idx = cuts_path.name.split(".")[1]
+            output_path = cuts_path.with_name(f"features.{shard_idx}.tar")
             futures.append(
                 ex.submit(
                     compute_features_one_shard,
-                    cuts=CutSet.from_file(shard),
+                    cuts=CutSet.from_shar(shard),
                     feature_config=feature_config,
                     output_path=output_path,
                     compression=compression,

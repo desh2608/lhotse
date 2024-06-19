@@ -9,6 +9,7 @@ This project is an effort to bridge the digital speech divide. Voice recognition
 How does it work?
 We are crowdsourcing an open-source dataset of voices. Donate your voice, validate the accuracy of other people's clips, make the dataset better for everyone.
 """
+import csv
 import logging
 import math
 import numbers
@@ -18,6 +19,7 @@ import warnings
 from collections import defaultdict
 from concurrent.futures.process import ProcessPoolExecutor
 from contextlib import contextmanager
+from multiprocessing import get_context as mp_get_context
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -30,6 +32,7 @@ from lhotse import (
     validate_recordings_and_supervisions,
 )
 from lhotse.audio import Recording, RecordingSet
+from lhotse.qa import fix_manifests
 from lhotse.supervision import SupervisionSegment, SupervisionSet
 from lhotse.utils import Pathlike, is_module_available, resumable_download, safe_extract
 
@@ -147,14 +150,13 @@ def _parse_utterance(
     language: str,
     audio_info: str,
 ) -> Optional[Tuple[Recording, SupervisionSegment]]:
-    audio_info = audio_info.split("\t", -1)
-    audio_path = lang_path / "clips" / audio_info[1]
+    audio_path = lang_path / "clips" / audio_info["path"]
 
     if not audio_path.is_file():
         logging.info(f"No such file: {audio_path}")
         return None
 
-    recording_id = Path(audio_info[1]).stem
+    recording_id = Path(audio_info["path"]).stem
     recording = Recording.from_file(path=audio_path, recording_id=recording_id)
 
     segment = SupervisionSegment(
@@ -164,12 +166,13 @@ def _parse_utterance(
         duration=recording.duration,
         channel=0,
         language=language,
-        speaker=audio_info[0],
-        text=audio_info[2].strip(),
-        gender=audio_info[6],
+        speaker=audio_info["client_id"],
+        text=audio_info["sentence"].strip(),
+        gender=audio_info["gender"],
         custom={
-            "age": audio_info[5],
-            "accents": audio_info[7],
+            "age": audio_info["age"],
+            "accents": audio_info["accents"],
+            "variant": audio_info["variant"],
         },
     )
     return recording, segment
@@ -197,23 +200,30 @@ def _prepare_part(
     tsv_path = lang_path / f"{part}.tsv"
 
     with disable_ffmpeg_torchaudio_info():
-        with ProcessPoolExecutor(num_jobs) as ex:
+        with ProcessPoolExecutor(
+            max_workers=num_jobs,
+            mp_context=mp_get_context("spawn"),
+        ) as ex:
+
             futures = []
             recordings = []
             supervisions = []
+            audio_infos = []
 
-            with open(tsv_path) as f:
-                audio_infos = iter(f.readlines())
+            with open(tsv_path, "r") as f:
 
-            for audio_info in tqdm(audio_infos, desc="Distributing tasks"):
-                futures.append(
-                    ex.submit(
-                        _parse_utterance,
-                        lang_path,
-                        lang,
-                        audio_info,
+                # Note: using QUOTE_NONE as CV dataset contains unbalanced quotes, cleanup needed later
+                audio_infos = csv.DictReader(f, delimiter="\t", quoting=csv.QUOTE_NONE)
+
+                for audio_info in tqdm(audio_infos, desc="Distributing tasks"):
+                    futures.append(
+                        ex.submit(
+                            _parse_utterance,
+                            lang_path,
+                            lang,
+                            audio_info,
+                        )
                     )
-                )
 
             for future in tqdm(futures, desc="Processing"):
                 result = future.result()
@@ -304,6 +314,12 @@ def prepare_commonvoice(
                 lang_path=lang_path,
                 num_jobs=num_jobs,
             )
+
+            # Fix manifests
+            recording_set, supervision_set = fix_manifests(
+                recording_set, supervision_set
+            )
+            validate_recordings_and_supervisions(recording_set, supervision_set)
 
             supervision_set.to_file(
                 output_dir / f"cv-{lang}_supervisions_{part}.jsonl.gz"

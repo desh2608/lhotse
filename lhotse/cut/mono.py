@@ -1,12 +1,12 @@
 import logging
-import math
 import warnings
 from dataclasses import dataclass
-from functools import reduce
+from functools import partial, reduce
 from operator import add
-from typing import Any, Callable, Iterable, List, Optional
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+import torch
 
 from lhotse.audio import Recording
 from lhotse.cut.data import DataCut
@@ -16,6 +16,7 @@ from lhotse.utils import (
     add_durations,
     fastcopy,
     hash_str_to_int,
+    is_equal_or_contains,
     merge_items_with_delimiter,
     overlaps,
     rich_exception_info,
@@ -80,13 +81,80 @@ class MonoCut(DataCut):
             )
         return None
 
+    @rich_exception_info
+    def load_video(
+        self,
+        with_audio: bool = True,
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+        """
+        Load the subset of video (and audio) from attached recording.
+        The data is trimmed to the [begin, end] range specified by the MonoCut.
+
+        :param with_audio: bool, whether to load and return audio alongside video. True by default.
+        :return: a tuple of video tensor and optionally audio tensor (or ``None``),
+            or ``None`` if this cut has no video.
+        """
+        if self.has_video:
+            return self.recording.load_video(
+                channels=self.channel,
+                offset=self.start,
+                duration=self.duration,
+                with_audio=with_audio,
+            )
+        return None
+
+    def with_channels(self, channels: Union[List[int], int]) -> DataCut:
+        """
+        Select specified channels from this cut.
+        Supports extending to other channels available in the underlying :class:`Recording`.
+        If a single channel is provided, we'll return a :class:`~lhotse.cut.MonoCut`,
+        otherwise we'll return a :class:`~lhotse.cut.MultiCut`.
+        """
+        channel_is_int = isinstance(channels, int)
+        assert set([channels] if channel_is_int else channels).issubset(
+            set(self.recording.channel_ids)
+        ), f"Cannot select {channels=} because they are not a subset of {self.recording.channel_ids=}"
+
+        mono = channel_is_int or len(channels) == 1
+        if mono:
+            if not channel_is_int:
+                (channels,) = channels
+            return MonoCut(
+                id=f"{self.id}-{channels}",
+                recording=self.recording,
+                start=self.start,
+                duration=self.duration,
+                channel=channels,
+                supervisions=[
+                    fastcopy(s, channel=channels)
+                    for s in self.supervisions
+                    if is_equal_or_contains(s.channel, channels)
+                ],
+                custom=self.custom,
+            )
+        else:
+            from lhotse import MultiCut
+
+            return MultiCut(
+                id=f"{self.id}-{len(channels)}chan",
+                start=self.start,
+                duration=self.duration,
+                channel=channels,
+                supervisions=[
+                    s
+                    for s in self.supervisions
+                    if is_equal_or_contains(channels, s.channel)
+                ],
+                custom=self.custom,
+            )
+
     def reverb_rir(
         self,
-        rir_recording: Optional["Recording"] = None,
+        rir_recording: Optional[Union[Recording, DataCut]] = None,
         normalize_output: bool = True,
         early_only: bool = False,
         affix_id: bool = True,
-        rir_channels: List[int] = [0],
+        rir_channels: Sequence[int] = (0,),
         room_rng_seed: Optional[int] = None,
         source_rng_seed: Optional[int] = None,
     ) -> DataCut:
@@ -194,25 +262,34 @@ class MonoCut(DataCut):
             )
 
     def merge_supervisions(
-        self, custom_merge_fn: Optional[Callable[[str, Iterable[Any]], Any]] = None
+        self,
+        merge_policy: str = "delimiter",
+        custom_merge_fn: Optional[Callable[[str, Iterable[Any]], Any]] = None,
     ) -> "MonoCut":
         """
         Return a copy of the cut that has all of its supervisions merged into
         a single segment.
 
         The new start is the start of the earliest superivion, and the new duration
-        is a minimum spanning duration for all the supervisions.
+        is a minimum spanning duration for all the supervisions. The text fields of
+        all segments are concatenated with a whitespace.
 
-        The text fields are concatenated with a whitespace, and all other string fields
-        (including IDs) are prefixed with "cat#" and concatenated with a hash symbol "#".
-        This is also applied to ``custom`` fields. Fields with a ``None`` value are omitted.
-
+        :param merge_policy: one of "keep_first" or "delimiter". If "keep_first", we
+            keep only the first segment's field value, otherwise all string fields
+            (including IDs) are prefixed with "cat#" and concatenated with a hash symbol "#".
+            This is also applied to ``custom`` fields. Fields with a ``None`` value are omitted.
         :param custom_merge_fn: a function that will be called to merge custom fields values.
             We expect ``custom_merge_fn`` to handle all possible custom keys.
             When not provided, we will treat all custom values as strings.
             It will be called roughly like:
             ``custom_merge_fn(custom_key, [s.custom[custom_key] for s in sups])``
         """
+        merge_func_ = partial(
+            merge_items_with_delimiter,
+            delimiter="#",
+            return_first=(merge_policy == "keep_first"),
+        )
+
         # "m" stands for merged in variable names below
 
         if custom_merge_fn is not None:
@@ -220,7 +297,7 @@ class MonoCut(DataCut):
             merge_custom = custom_merge_fn
         else:
             # Merge the string representations of custom fields.
-            merge_custom = lambda k, vs: merge_items_with_delimiter(map(str, vs))
+            merge_custom = lambda k, vs: merge_func_(map(str, vs))
 
         sups = sorted(self.supervisions, key=lambda s: s.start)
 
@@ -249,15 +326,15 @@ class MonoCut(DataCut):
             )
 
         msup = SupervisionSegment(
-            id=merge_items_with_delimiter(s.id for s in sups),
+            id=merge_func_(s.id for s in sups),
             recording_id=sups[0].recording_id,
             start=mstart,
             duration=mduration,
             channel=sups[0].channel,
             text=" ".join(s.text for s in sups if s.text),
-            speaker=merge_items_with_delimiter(s.speaker for s in sups if s.speaker),
-            language=merge_items_with_delimiter(s.language for s in sups if s.language),
-            gender=merge_items_with_delimiter(s.gender for s in sups if s.gender),
+            speaker=merge_func_(s.speaker for s in sups if s.speaker),
+            language=merge_func_(s.language for s in sups if s.language),
+            gender=merge_func_(s.gender for s in sups if s.gender),
             custom={
                 k: merge_custom(
                     k,

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from lhotse import (
+    AudioSource,
     Fbank,
     FbankConfig,
     Features,
@@ -16,8 +17,8 @@ from lhotse import (
     SupervisionSet,
     load_manifest,
 )
-from lhotse.audio import AudioSource
 from lhotse.cut import CutSet, MixedCut, MixTrack, MonoCut, MultiCut
+from lhotse.cut.describe import CutSetStatistics
 from lhotse.serialization import load_jsonl
 from lhotse.testing.dummies import (
     DummyManifest,
@@ -31,12 +32,23 @@ from lhotse.utils import is_module_available
 
 
 @pytest.fixture
+def mini_librispeeh2_cut_set():
+    recordings = RecordingSet.from_file(
+        "test/fixtures/mini_librispeech2/lhotse/recordings.jsonl.gz"
+    )
+    supervisions = SupervisionSet.from_file(
+        "test/fixtures/mini_librispeech2/lhotse/supervisions.jsonl.gz"
+    )
+    return CutSet.from_manifests(recordings=recordings, supervisions=supervisions)
+
+
+@pytest.fixture
 def cut_set_with_mixed_cut(cut1, cut2):
     mixed_cut = MixedCut(
         id="mixed-cut-id",
         tracks=[MixTrack(cut=cut1), MixTrack(cut=cut2, offset=1.0, snr=10)],
     )
-    return CutSet({cut.id: cut for cut in [cut1, cut2, mixed_cut]})
+    return CutSet([cut1, cut2, mixed_cut])
 
 
 @pytest.mark.parametrize(
@@ -51,6 +63,18 @@ def test_cut_set_sort_by_duration(cut_set_with_mixed_cut, ascending, expected):
     assert [c.duration for c in cs] == expected
 
 
+@pytest.mark.parametrize(
+    ["ascending", "expected"],
+    [
+        (True, ["lbi-3536-23268-0000", "lbi-6241-61943-0000", "lbi-8842-304647-0000"]),
+        (False, ["lbi-8842-304647-0000", "lbi-6241-61943-0000", "lbi-3536-23268-0000"]),
+    ],
+)
+def test_cut_set_sort_by_recording_id(mini_librispeeh2_cut_set, ascending, expected):
+    cs = mini_librispeeh2_cut_set.sort_by_recording_id(ascending)
+    assert [c.recording.id for c in cs] == expected
+
+
 def test_cut_set_iteration(cut_set_with_mixed_cut):
     cuts = list(cut_set_with_mixed_cut)
     assert len(cut_set_with_mixed_cut) == 3
@@ -58,10 +82,10 @@ def test_cut_set_iteration(cut_set_with_mixed_cut):
 
 
 def test_cut_set_holds_both_simple_and_mixed_cuts(cut_set_with_mixed_cut):
-    simple_cuts = cut_set_with_mixed_cut.simple_cuts.values()
+    simple_cuts = cut_set_with_mixed_cut.simple_cuts
     assert all(isinstance(c, MonoCut) for c in simple_cuts)
     assert len(simple_cuts) == 2
-    mixed_cuts = cut_set_with_mixed_cut.mixed_cuts.values()
+    mixed_cuts = cut_set_with_mixed_cut.mixed_cuts
     assert all(isinstance(c, MixedCut) for c in mixed_cuts)
     assert len(mixed_cuts) == 1
 
@@ -357,6 +381,25 @@ def test_cut_set_describe_runs(cut_set, full, capfd):
     out, err = capfd.readouterr()
     assert out != ""
     assert err == ""
+
+
+@pytest.mark.parametrize("full", [True, False])
+def test_cut_set_stats_combine(cut_set, full, capfd):
+
+    # Describe a "large" cut set containing two parts
+    cs = cut_set.repeat(2)
+    cs.describe(full=full)
+    out, err = capfd.readouterr()
+
+    # Describe a combination of stats from two parts of that cut set
+    stats1 = CutSetStatistics(full=full).accumulate(cut_set)
+    stats2 = CutSetStatistics(full=full).accumulate(cut_set)
+    stats = stats1.combine(stats2)
+    stats.describe()
+    out2, err2 = capfd.readouterr()
+
+    assert out == out2
+    assert err == err2
 
 
 def test_cut_map_supervisions(cut_set):
@@ -659,9 +702,6 @@ def test_cut_set_decompose_output_dir_doesnt_duplicate_recording():
         td = Path(td)
         cuts.decompose(output_dir=td)
 
-        text = load_jsonl(td / "recordings.jsonl.gz")
-        print(list(text))
-
         recs = load_manifest(td / "recordings.jsonl.gz")
         assert isinstance(recs, RecordingSet)
         # deduplicated recording
@@ -685,3 +725,10 @@ def test_cut_set_from_files():
         assert cs[0].id == "dummy-mono-cut-0000"
         # On second iteration, we see a different order
         assert cs[0].id == "dummy-mono-cut-0010"
+
+
+def test_cut_set_duplicate_ids_allowed():
+    cut = dummy_cut(0)
+    cuts = CutSet.from_cuts([cut, cut])
+    assert len(cuts) == 2
+    assert cuts[0].id == cuts[1].id

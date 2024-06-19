@@ -92,7 +92,6 @@ annotations of roles, dialog, summary etc. but we have not included them in this
 
 import itertools
 import logging
-import ssl
 import urllib
 import xml.etree.ElementTree as ET
 import zipfile
@@ -100,11 +99,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
-import soundfile as sf
 from tqdm.auto import tqdm
 
 from lhotse import validate_recordings_and_supervisions
-from lhotse.audio import AudioSource, Recording, RecordingSet, read_sph
+from lhotse.audio import AudioSource, Recording, RecordingSet
+from lhotse.audio.backend import read_sph
 from lhotse.qa import fix_manifests
 from lhotse.recipes.utils import normalize_text_ami
 from lhotse.supervision import AlignmentItem, SupervisionSegment, SupervisionSet
@@ -391,6 +390,7 @@ def prepare_audio_grouped(
 ) -> RecordingSet:
     # Group together multiple channels from the same session.
     # We will use that to create a Recording with multiple sources (channels).
+    import soundfile as sf
     from cytoolz import groupby
 
     channel_wavs = groupby(lambda p: p.parts[-2], audio_paths)

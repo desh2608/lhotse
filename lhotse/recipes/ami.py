@@ -26,6 +26,7 @@ These can be specified using the `mic` argument.
 
 import itertools
 import logging
+import os
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -197,7 +198,10 @@ def download_audio(
             wav_dir.mkdir(parents=True, exist_ok=True)
             wav_path = wav_dir / wav_name
             resumable_download(
-                wav_url, filename=wav_path, force_download=force_download
+                wav_url,
+                filename=wav_path,
+                force_download=force_download,
+                missing_ok=True,
             )
         elif mic == "mdm":
             for array in MDM_ARRAYS:
@@ -208,7 +212,10 @@ def download_audio(
                     wav_dir.mkdir(parents=True, exist_ok=True)
                     wav_path = wav_dir / wav_name
                     resumable_download(
-                        wav_url, filename=wav_path, force_download=force_download
+                        wav_url,
+                        filename=wav_path,
+                        force_download=force_download,
+                        missing_ok=True,
                     )
         elif mic == "mdm8-bf":
             wav_name = f"{item}_MDM8.wav"

@@ -472,7 +472,7 @@ class Features:
             start = self.start
         # In case the caller requested only a sub-span of the features, trim them.
         # Left trim
-        if start < self.start - 1e-5:
+        if start < self.start - 1e-3:
             raise ValueError(
                 f"Cannot load features for recording {self.recording_id} starting from {start}s. "
                 f"The available range is ({self.start}, {self.end}) seconds."
@@ -697,21 +697,14 @@ class FeatureSet(Serializable, AlgorithmMixin):
         if first is not None:
             assert first > 0
             out = FeatureSet.from_items(islice(self, first))
-            if len(out) < first:
-                logging.warning(
-                    f"FeatureSet has only {len(out)} items but first {first} were requested."
-                )
             return out
 
         if last is not None:
             assert last > 0
-            if last > len(self):
-                logging.warning(
-                    f"FeatureSet has only {len(self)} items but last {last} required; "
-                    f"not doing anything."
-                )
+            N = len(self)
+            if last > N:
                 return self
-            return FeatureSet.from_features(self.features[-last:])
+            return FeatureSet.from_items(islice(self, N - last, N))
 
     def find(
         self,

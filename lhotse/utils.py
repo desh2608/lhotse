@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import random
+import secrets
 import sys
 import urllib
 import uuid
@@ -24,18 +25,19 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     Sequence,
     Tuple,
     TypeVar,
     Union,
 )
+from urllib.parse import urlparse
 
 import click
 import numpy as np
 import torch
 from tqdm.auto import tqdm
-from typing_extensions import Literal
 
 Pathlike = Union[Path, str]
 T = TypeVar("T")
@@ -125,6 +127,14 @@ class SmartOpen:
             transport_params=transport_params,
             **kwargs,
         )
+
+
+def is_valid_url(value: str) -> bool:
+    try:
+        result = urlparse(value)
+        return bool(result.scheme) and bool(result.netloc)
+    except AttributeError:
+        return False
 
 
 def fix_random_seed(random_seed: int):
@@ -280,6 +290,7 @@ def split_manifest_lazy(
     chunk_size: int,
     prefix: str = "",
     num_digits: int = 8,
+    start_idx: int = 0,
 ) -> List:
     """
     Splits a manifest (either lazily or eagerly opened) into chunks, each
@@ -297,6 +308,7 @@ def split_manifest_lazy(
     :param chunk_size: the number of items in each chunk.
     :param prefix: the prefix of each manifest.
     :param num_digits: the width of ``split_idx``, which will be left padded with zeros to achieve it.
+    :param start_idx: The split index to start counting from (default is ``0``).
     :return: a list of lazily opened chunk manifests.
     """
     from lhotse.serialization import SequentialJsonlWriter
@@ -307,9 +319,13 @@ def split_manifest_lazy(
     if prefix == "":
         prefix = "split"
 
-    items = iter(it)
-    split_idx = 0
+    split_idx = start_idx
     splits = []
+    items = iter(it)
+    try:
+        item = next(items)
+    except StopIteration:
+        return splits
     while True:
         try:
             written = 0
@@ -318,9 +334,9 @@ def split_manifest_lazy(
                 (output_dir / prefix).with_suffix(f".{idx}.jsonl.gz")
             ) as writer:
                 while written < chunk_size:
-                    item = next(items)
                     writer.write(item)
                     written += 1
+                    item = next(items)
             split_idx += 1
         except StopIteration:
             break
@@ -451,9 +467,11 @@ def resumable_download(
     filename: Pathlike,
     force_download: bool = False,
     completed_file_size: Optional[int] = None,
+    missing_ok: bool = False,
 ) -> None:
     # Check if the file exists and get its size
-    if os.path.exists(filename):
+    file_exists = os.path.exists(filename)
+    if file_exists:
         if force_download:
             logging.info(
                 f"Removing existing file and downloading from scratch because force_download=True: {filename}"
@@ -467,16 +485,29 @@ def resumable_download(
         file_size = 0
 
     # Set the request headers to resume downloading
-    headers = {"Range": "bytes={}-".format(file_size)}
+    # Also set user-agent header to stop picky servers from complaining with 403
+    ua_headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_4) AppleWebKit/603.1.30 (KHTML, like Gecko) Version/10.1 Safari/603.1.30",
+    }
+
+    headers = {
+        "Range": "bytes={}-".format(file_size),
+        **ua_headers,
+    }
 
     # Create a request object with the URL and headers
     req = urllib.request.Request(url, headers=headers)
 
     # Open the file for writing in binary mode and seek to the end
-    with open(filename, "ab") as f:
+    # r+b is needed in order to allow seeking at the beginning of a file
+    # when downloading from scratch
+    mode = "r+b" if file_exists else "wb"
+    with open(filename, mode) as f:
 
         def _download(rq, size):
-            f.seek(size)
+            f.seek(size, 0)
+            # just in case some garbage was written to the file, truncate it
+            f.truncate()
 
             # Open the URL and read the contents in chunks
             with urllib.request.urlopen(rq) as response:
@@ -501,8 +532,25 @@ def resumable_download(
         except urllib.error.HTTPError as e:
             # "Request Range Not Satisfiable" means the requested range
             # starts after the file ends OR that the server does not support range requests.
-            if e.code == 416:
-                if e.headers.get("Content-Range", "") == f"bytes */{file_size}":
+            if e.code == 404 and missing_ok:
+                logging.warning(
+                    f"{url} does not exist (error 404). Skipping this file."
+                )
+                if Path(filename).is_file():
+                    os.remove(filename)
+            elif e.code == 416:
+                content_range = e.headers.get("Content-Range", None)
+                if content_range is None:
+                    # sometimes, the server actually supports range requests
+                    # but does not return the Content-Range header with 416 code
+                    # This is out of spec, but let us check twice for pragmatic reasons.
+                    head_req = urllib.request.Request(url, method="HEAD")
+                    head_res = urllib.request.urlopen(head_req)
+                    if head_res.headers.get("Accept-Ranges", "none") != "none":
+                        content_length = head_res.headers.get("Content-Length")
+                        content_range = f"bytes */{content_length}"
+
+                if content_range == f"bytes */{file_size}":
                     # If the content-range returned by server also matches the file size,
                     # then the file is already downloaded
                     logging.info(f"File already downloaded: {filename}")
@@ -510,7 +558,7 @@ def resumable_download(
                     logging.info(
                         "Server does not support range requests - attempting downloading from scratch"
                     )
-                    _download(urllib.request.Request(url), 0)
+                    _download(urllib.request.Request(url, headers=ua_headers), 0)
             else:
                 raise e
 
@@ -577,7 +625,7 @@ class nullcontext(AbstractContextManager):
     Note(pzelasko): This is copied from Python 3.7 stdlib so that we can use it in 3.6.
     """
 
-    def __init__(self, enter_result=None):
+    def __init__(self, enter_result=None, *args, **kwargs):
         self.enter_result = enter_result
 
     def __enter__(self):
@@ -596,7 +644,7 @@ def perturb_num_samples(num_samples: int, factor: float) -> int:
 
 
 def compute_num_samples(
-    duration: Seconds, sampling_rate: int, rounding=ROUND_HALF_UP
+    duration: Seconds, sampling_rate: Union[int, float], rounding=ROUND_HALF_UP
 ) -> int:
     """
     Convert a time quantity to the number of samples given a specific sampling rate.
@@ -659,25 +707,21 @@ def compute_start_duration_for_extended_cut(
 
 
 def merge_items_with_delimiter(
-    values: Iterable[str], prefix: str = "cat", delimiter: str = "#"
+    values: Iterable[str],
+    prefix: str = "cat",
+    delimiter: str = "#",
+    return_first: bool = False,
 ) -> Optional[str]:
     # e.g.
     # values = ["1125-76840-0001", "1125-53670-0003"]
     # return "cat#1125-76840-0001#1125-53670-0003"
+    # if return_first is True, return "1125-76840-0001"
     values = list(values)
     if len(values) == 0:
         return None
-    if len(values) == 1:
+    if len(values) == 1 or return_first:
         return values[0]
     return delimiter.join(chain([prefix], values))
-
-
-def index_by_id_and_check(manifests: Iterable[T]) -> Dict[str, T]:
-    id2man = {}
-    for m in manifests:
-        assert m.id not in id2man, f"Duplicated manifest ID: {m.id}"
-        id2man[m.id] = m
-    return id2man
 
 
 def exactly_one_not_null(*args) -> bool:
@@ -1057,3 +1101,21 @@ class PythonLiteralOption(click.Option):
                 return val
         except:
             return None
+
+
+def is_torchaudio_available() -> bool:
+    return is_module_available("torchaudio")
+
+
+def build_rng(seed: Union[int, Literal["trng"]]) -> random.Random:
+    if seed == "trng":
+        return secrets.SystemRandom()
+    else:
+        return random.Random(seed)
+
+
+_LHOTSE_DILL_ENABLED = False
+
+
+def is_dill_enabled() -> bool:
+    return _LHOTSE_DILL_ENABLED or os.environ["LHOTSE_DILL_ENABLED"]
