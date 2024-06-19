@@ -317,7 +317,7 @@ class MixedCut(Cut):
             for idx, cut in non_padding_cuts
             if cut.custom is not None and attr_name in cut.custom
         ]
-        assert len(non_padding_cuts_with_custom_attr) == 1, (
+        assert len(non_padding_cuts_with_custom_attr) <= 1, (
             f"This MixedCut has {len(non_padding_cuts_with_custom_attr)} non-padding cuts "
             f"with a custom attribute '{attr_name}'. We currently don't support mixing custom attributes. "
             f"Consider dropping the attribute on all but one of DataCuts. Problematic cut:\n{self}"
